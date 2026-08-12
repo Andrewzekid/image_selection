@@ -217,23 +217,14 @@ python plot_trajectory_heatmap.py --all --combined --out ../inspection_database/
 
 ## Requirements
 
-Python 3.10+. The scripts in this folder depend on a subset of the packages
-listed in [`requirements.txt`](requirements.txt). The third-party libraries
-actually imported by these three scripts are:
+Python 3.10+. The third-party libraries imported by these three scripts are:
 
 - `numpy` — pose arrays, quaternion math, cost matrix
 - `opencv-python` (`cv2`) — reading/writing/merging images for `--matched-dir`
 - `matplotlib` — trajectory heatmap and matched-pair trajectory plots
 
-(`scipy` is no longer required — the previous Hungarian-algorithm 1:1
-matching was replaced by per-source nearest-candidate matching.)
-
-Install via the backend venv, which already provides these:
-
 ```bash
 pip install -r requirements.txt
-# or just the subset needed here:
-pip install "numpy>=2.1.3,<2.3" "opencv-python>=4.10.0" "matplotlib>=3.7"
 ```
 ## Notes
 

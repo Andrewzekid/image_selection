@@ -542,10 +542,10 @@ def _plot_trajectories(
     pairs: list[dict[str, Any]] | None = None,
     out_path: str | None = None,
 ) -> None:
-    """Plot source vs target inspection trajectories (tf x/y) with matplotlib.
+    """Plot source vs target inspection trajectories (cam_tf x/z) with matplotlib.
 
     Each inspection's images are projected to the ground plane using their
-    ``cam_tf_translation_x`` / ``cam_tf_translation_y`` and drawn as a light gray
+    ``cam_tf_translation_x`` / ``cam_tf_translation_z`` and drawn as a light gray
     trajectory line. When ``pairs`` is given, each matched source-target pair
     is drawn as two points sharing a single colour from a red-to-blue colormap
     (``RdBu``), with a thin dashed line connecting them, so matched
@@ -556,39 +556,39 @@ def _plot_trajectories(
     import matplotlib.pyplot as plt
 
     def _pos(insp: int) -> tuple[list[float], list[float]]:
-        xs, ys = [], []
+        xs, zs = [], []
         for row in conn.execute(
-            "SELECT cam_tf_translation_x AS tx, cam_tf_translation_y AS ty "
+            "SELECT cam_tf_translation_x AS tx, cam_tf_translation_z AS tz "
             "FROM images WHERE inspection_id = ? "
             "AND cam_tf_translation_x IS NOT NULL ORDER BY id",
             (insp,),
         ):
             xs.append(row["tx"])
-            ys.append(row["ty"])
-        return xs, ys
+            zs.append(row["tz"])
+        return xs, zs
 
     plt.figure(figsize=(12, 7))
 
     # Draw both full trajectories as faint gray lines for context.
     for insp in (source_inspection, target_inspection):
-        xs, ys = _pos(insp)
+        xs, zs = _pos(insp)
         if xs:
-            plt.plot(xs, ys, "-", color="lightgray", markersize=0, linewidth=0.8,
+            plt.plot(xs, zs, "-", color="lightgray", markersize=0, linewidth=0.8,
                      zorder=1)
 
     # Draw matched pairs: each pair gets a unique colour from RdBu (red->blue).
     if pairs:
-        # Build id -> (tx, ty) lookup for both inspections.
+        # Build id -> (tx, tz) lookup for both inspections.
         src_pos = {}
         tgt_pos = {}
         for row in conn.execute(
-            "SELECT id, inspection_id, cam_tf_translation_x AS tx, cam_tf_translation_y AS ty "
+            "SELECT id, inspection_id, cam_tf_translation_x AS tx, cam_tf_translation_z AS tz "
             "FROM images WHERE cam_tf_translation_x IS NOT NULL ORDER BY id",
         ):
             if row["inspection_id"] == source_inspection:
-                src_pos[row["id"]] = (row["tx"], row["ty"])
+                src_pos[row["id"]] = (row["tx"], row["tz"])
             elif row["inspection_id"] == target_inspection:
-                tgt_pos[row["id"]] = (row["tx"], row["ty"])
+                tgt_pos[row["id"]] = (row["tx"], row["tz"])
 
         n = len(pairs)
         cmap = plt.cm.RdBu
@@ -622,13 +622,13 @@ def _plot_trajectories(
             (source_inspection, "tab:blue", f"Inspection {source_inspection} (source)"),
             (target_inspection, "tab:orange", f"Inspection {target_inspection} (target)"),
         ):
-            xs, ys = _pos(insp)
+            xs, zs = _pos(insp)
             if xs:
-                plt.plot(xs, ys, "-o", color=color, markersize=2, linewidth=1, label=label)
+                plt.plot(xs, zs, "-o", color=color, markersize=2, linewidth=1, label=label)
         plt.title("Inspection trajectories (camera_init frame)")
 
-    plt.xlabel("tf x (m)")
-    plt.ylabel("tf y (m)")
+    plt.xlabel("cam_tf x (m)")
+    plt.ylabel("cam_tf z (m)")
     plt.legend()
     plt.grid(alpha=0.3)
     plt.axis("equal")
