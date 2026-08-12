@@ -1,0 +1,1004 @@
+#!/usr/bin/env python3
+"""Pose-based image matching across two inspection runs.
+
+For each image in a *source* set (by default the files in
+``MTR Inspection Database/sampled_images/``, which are a subset of inspection 1,
+named ``<image_id>.jpg``), find the image in a *target* inspection (default 2)
+that was taken from the same viewpoint, by comparing the camera pose stored on
+the ``images`` table (``tf_translation_{x,y,z}`` + quaternion
+``tf_rotation_{x,y,z,w}``).
+
+Both inspections live in the shared ``camera_init`` (FastLIO) global frame and
+traverse the same route, so poses are directly comparable - no cross-run
+alignment is needed.
+
+Matching is optimal 1:1 via the Hungarian algorithm
+(``scipy.optimize.linear_sum_assignment``) on a cost of
+
+    cost = translation_m + rot_weight * rotation_deg
+
+with a threshold gate (``max_dist_m`` / ``max_rot_deg``) that drops pairs whose
+nearest available partner is actually a different viewpoint.
+
+Run with the backend venv so scipy/numpy are available, e.g.::
+
+    python backend/scripts/match_images_by_pose.py \
+        --target-inspection 2 --json pairs.json
+
+To sample the source images on the fly at a fixed distance interval (via
+``sample_images_along_trajectory.py``) before matching instead of relying on an
+existing ``--sampled-dir``, add ``--sample-interval-m`` (and the inspection to
+sample from with ``--sample-inspection``)
+
+Match L+R pairs from inspection 1 against target inspection 3 at 1.25 m
+sampling with a tight 0.3 m translation / 10 deg rotation gate, using the
+database and images inside ``inspection_database/`` and saving the
+matched-pairs JSON, the merged side-by-side matched images, the split
+source/target folders, and the trajectory plot all under
+``inspection_database/``::
+
+    python backend/scripts/match_images_by_pose.py \
+        --db "inspection_database/inspection_v2.db" \
+        --image-dir "inspection_database/outputs/images" \
+        --sampled-dir "inspection_database/sampled_images" \
+        --target-inspection 3 --sample-inspection 1 \
+        --sample-interval-m 1.25 --max-dist-m 0.3 --max-rot-deg 10 \
+        --select-pair \
+        --plot --plot-out "inspection_database/trajectory_insp1_vs_3.png" \
+        --matched-dir "inspection_database/matched_pairs_tight" --no-show \
+        --copy-split-dir "inspection_database/split_pairs" \
+        --json "inspection_database/pairs_insp3_tight.json" \
+        --config-out "inspection_database/config.json"
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import shutil
+import sqlite3
+import sys
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+from scipy.optimize import linear_sum_assignment
+
+import sample_images_along_trajectory as sampler
+
+# Repo root is two levels up from this script (backend/scripts/ -> repo root),
+# so defaults resolve correctly regardless of the current working directory.
+INSPECTION_DIRECTORY = "inspection_database"
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_DEFAULT_DB = _REPO_ROOT / INSPECTION_DIRECTORY / "inspection_v2.db"
+_DEFAULT_SAMPLED_DIR = _REPO_ROOT / INSPECTION_DIRECTORY / "sampled_images"
+_DEFAULT_IMAGE_DIR = _REPO_ROOT / INSPECTION_DIRECTORY / "outputs" / "images"
+
+
+def _fmt_num(x: float) -> str:
+    """Format a float for use in a folder name: 0.75 -> '0p75', 1.0 -> '1', 15.0 -> '15'."""
+    s = f"{x:g}"
+    return s.replace(".", "p")
+
+
+def _load_inspection(
+    conn: sqlite3.Connection, inspection_id: int
+) -> tuple[list[dict[str, Any]], list[int]]:
+    """All pose-bearing images of one inspection with a known lens, ordered by id.
+
+    L/R is assigned by clustering images on their identical pose + timestamp:
+    consecutive captures form a left/right pair from the *same* pose, sharing
+    an identical pose (translation AND quaternion) and the same ``timestamp_ns``.
+    Every size-2 cluster is one L/R pair, with the lower id = LEFT. Size-1
+    clusters are unpaired frames whose lens is ambiguous; they are excluded
+    from matching.
+
+    Returns ``(rows, unpaired_ids)``. Each row gets a ``parity`` of "L" or "R".
+    """
+    raw = conn.execute(
+        """
+        SELECT id, inspection_id, filename, timestamp_ns,
+               tf_translation_x AS tx, tf_translation_y AS ty, tf_translation_z AS tz,
+               tf_rotation_x AS rx, tf_rotation_y AS ry,
+               tf_rotation_z AS rz, tf_rotation_w AS rw
+        FROM images
+        WHERE inspection_id = ? AND tf_translation_x IS NOT NULL
+                                   AND tf_rotation_w IS NOT NULL
+        ORDER BY id
+        """,
+        (inspection_id,),
+    ).fetchall()
+
+    rows: list[dict[str, Any]] = []
+    unpaired: list[int] = []
+
+    # Group consecutive rows by identical (timestamp_ns, translation, rotation).
+    # Consecutive captures sharing the same pose + timestamp form an L/R pair.
+    i = 0
+    while i < len(raw):
+        d = dict(raw[i])
+        # Look ahead to find all rows with identical pose + timestamp.
+        j = i + 1
+        while j < len(raw):
+            nxt = raw[j]
+            if (nxt["timestamp_ns"] == d["timestamp_ns"]
+                    and nxt["tx"] == d["tx"]
+                    and nxt["ty"] == d["ty"]
+                    and nxt["tz"] == d["tz"]
+                    and nxt["rx"] == d["rx"]
+                    and nxt["ry"] == d["ry"]
+                    and nxt["rz"] == d["rz"]
+                    and nxt["rw"] == d["rw"]):
+                j += 1
+            else:
+                break
+        grp = [dict(r) for r in raw[i:j]]
+        if len(grp) == 2:
+            grp[0]["parity"] = "L"  # lower id = LEFT
+            grp[1]["parity"] = "R"
+            rows.extend(grp)
+        elif len(grp) == 1:
+            unpaired.append(grp[0]["id"])
+        else:
+            # Unexpected cluster size (>2): assign L/R to first two, rest unpaired.
+            grp[0]["parity"] = "L"
+            grp[1]["parity"] = "R"
+            rows.extend(grp[:2])
+            for r in grp[2:]:
+                unpaired.append(r["id"])
+        i = j
+    return rows, unpaired
+
+
+def _quat_rotation_deg(
+    q_src: np.ndarray, q_tgt: np.ndarray
+) -> np.ndarray:
+    """Geodesic rotation angle (degrees) between quaternions, broadcastable.
+
+    ``q_src`` is (N, 4), ``q_tgt`` is (M, 4); returns (N, M). ``abs(dot)``
+    folds the quaternion double-cover (q and -q are the same rotation).
+    """
+    dot = np.abs(q_src @ q_tgt.T)
+    dot = np.clip(dot, 0.0, 1.0)
+    return np.degrees(2.0 * np.arccos(dot))
+
+
+def _match_all(
+    sources: list[dict[str, Any]],
+    candidates: list[dict[str, Any]],
+    max_dist_m: float,
+    max_rot_deg: float,
+    rot_weight: float,
+) -> list[dict[str, Any]]:
+    """Optimal 1:1 assignment of sources -> candidates with same-lens gating.
+
+    Only same-lens pairs (L->L, R->R) are accepted, when ``rot <= max_rot_deg``
+    (near 0). Cross-lens matching (L->R, R->L) is not supported.
+
+    Cost is ``trans + rot_weight * rot``.
+
+    Returns one dict per kept pair. Sources with no acceptable candidate are
+    omitted; the caller reports them.
+    """
+    if not sources or not candidates:
+        return []
+
+    P = np.array([[s["tx"], s["ty"], s["tz"]] for s in sources], dtype=float)
+    C = np.array([[c["tx"], c["ty"], c["tz"]] for c in candidates], dtype=float)
+    qP = np.array([[s["rx"], s["ry"], s["rz"], s["rw"]] for s in sources], dtype=float)
+    qC = np.array([[c["rx"], c["ry"], c["rz"], c["rw"]] for c in candidates], dtype=float)
+
+    trans = np.sqrt(((P[:, None, :] - C[None, :, :]) ** 2).sum(-1))  # (N, M)
+    rot = _quat_rotation_deg(qP, qC)                                  # (N, M)
+
+    src_lens = np.array([s["parity"] for s in sources])[:, None]  # (N, 1)
+    tgt_lens = np.array([c["parity"] for c in candidates])[None, :]  # (1, M)
+    same_lens = (src_lens == tgt_lens)  # (N, M) bool
+
+    cost = trans + rot_weight * rot
+
+    # Gate: same lens only, rotation near 0.
+    rot_ok = same_lens & (rot <= max_rot_deg)
+
+    infeasible = (trans > max_dist_m) | ~rot_ok
+    cost = np.where(infeasible, cost.max() + 1.0e6, cost)
+
+    row_ind, col_ind = linear_sum_assignment(cost)
+    pairs: list[dict[str, Any]] = []
+    for i, j in zip(row_ind, col_ind):
+        if infeasible[i, j]:
+            continue
+        s, c = sources[i], candidates[j]
+        pairs.append(
+            {
+                "sampled_id": int(s["id"]),
+                "target_id": int(c["id"]),
+                "parity": s["parity"],
+                "target_parity": c["parity"],
+                "match_type": "same_lens",
+                "translation_m": float(trans[i, j]),
+                "rotation_deg": float(rot[i, j]),
+                "cost": float(cost[i, j]),
+            }
+        )
+    return pairs
+
+
+def _nearest_distance(
+    src: dict[str, Any], candidates: list[dict[str, Any]]
+) -> tuple[float, float, int | None, str | None]:
+    """Nearest candidate's (translation_m, rotation_deg, id, match_type) for diagnostics.
+
+    Considers only same-lens candidates, returns the one with the smallest
+    translation distance.
+    """
+    if not candidates:
+        return float("inf"), float("inf"), None, None
+    same = [c for c in candidates if c["parity"] == src["parity"]]
+    if not same:
+        return float("inf"), float("inf"), None, None
+    P = np.array([[src["tx"], src["ty"], src["tz"]]], dtype=float)
+    C = np.array([[c["tx"], c["ty"], c["tz"]] for c in same], dtype=float)
+    qP = np.array([[src["rx"], src["ry"], src["rz"], src["rw"]]], dtype=float)
+    qC = np.array([[c["rx"], c["ry"], c["rz"], c["rw"]] for c in same], dtype=float)
+    trans = np.sqrt(((P[:, None, :] - C[None, :, :]) ** 2).sum(-1))[0]
+    rot = _quat_rotation_deg(qP, qC)[0]
+    j = int(np.argmin(trans))
+    return float(trans[j]), float(rot[j]), int(same[j]["id"]), "same_lens"
+
+
+def _load_sampled_ids(sampled_dir: Path) -> list[int]:
+    """Image ids from ``<id>.jpg`` filenames in ``sampled_dir``."""
+    ids: list[int] = []
+    for p in sorted(sampled_dir.iterdir()):
+        if p.is_file() and p.suffix.lower() in (".jpg", ".jpeg", ".png"):
+            stem = p.stem
+            if stem.isdigit():
+                ids.append(int(stem))
+    return sorted(ids)
+
+
+def _resolve_source_inspection(conn: sqlite3.Connection, sampled_ids: list[int]) -> int | None:
+    """Inspection id that the sampled images belong to (all should match)."""
+    if not sampled_ids:
+        return None
+    placeholders = ",".join("?" * len(sampled_ids))
+    row = conn.execute(
+        f"SELECT inspection_id, COUNT(*) AS n FROM images "
+        f"WHERE id IN ({placeholders}) GROUP BY inspection_id ORDER BY n DESC LIMIT 1",
+        sampled_ids,
+    ).fetchone()
+    return int(row["inspection_id"]) if row else None
+
+
+def _commit_pairs(
+    conn: sqlite3.Connection, pairs: list[dict[str, Any]], skip_existing: bool
+) -> int:
+    """Insert matched pairs into abnormal_detections(gt_image, inspection_image).
+
+    ``gt_image`` is the inspection-1 (reference) id, ``inspection_image`` the
+    inspection-2 id. With ``skip_existing`` (default), pairs already present are
+    left untouched so LLM-annotated rows are never clobbered. Returns the number
+    inserted.
+    """
+    # Assign ids explicitly (starting at MAX(id)+1) rather than relying on the
+    # table's AUTOINCREMENT counter. AUTOINCREMENT keeps a monotonic high-water
+    # mark in sqlite_sequence that never decreases, so after rows are deleted the
+    # raw id would otherwise resume from a stale value (e.g. 526) instead of
+    # continuing sequentially from the surviving rows.
+    next_id = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) + 1 FROM abnormal_detections"
+    ).fetchone()[0]
+    inserted = 0
+    for p in pairs:
+        gt, src = p["sampled_id"], p["target_id"]
+        if skip_existing:
+            exists = conn.execute(
+                "SELECT 1 FROM abnormal_detections "
+                "WHERE gt_image = ? AND inspection_image = ? LIMIT 1",
+                (gt, src),
+            ).fetchone()
+            if exists:
+                continue
+        conn.execute(
+            "INSERT INTO abnormal_detections "
+            "(id, gt_image, inspection_image, status, summary, viewpoint_change) "
+            "VALUES (?, ?, ?, 'NOT_PROCESSED', '', 0)",
+            (next_id, gt, src),
+        )
+        next_id += 1
+        inserted += 1
+    conn.commit()
+    return inserted
+
+
+def _load_timestamps(conn: sqlite3.Connection) -> dict[int, int]:
+    """Lookup image id -> timestamp_ns from the database."""
+    return {row["id"]: row["timestamp_ns"] for row in conn.execute(
+        "SELECT id, timestamp_ns FROM images WHERE timestamp_ns IS NOT NULL"
+    )}
+
+
+def _copy_matched_images(
+    pairs: list[dict[str, Any]],
+    sampled_dir: Path,
+    image_dir: Path,
+    out_dir: Path,
+    show: bool = True,
+) -> list[Path]:
+    """Write each matched pair as a single merged image (source left, target
+    right) into ``out_dir``, named ``<src_ts>__<tgt_ts>.jpg`` where ``_ts`` is
+    the ``timestamp_ns`` of each image.
+
+    Optionally spawn a cv2 window showing each merged pair. Returns the list of
+    merged files written. Requires opencv-python (``cv2``).
+    """
+    if not pairs:
+        return []
+    try:
+        import cv2
+    except ImportError as e:  # pragma: no cover
+        print(f"[error] --matched-dir needs opencv (cv2): missing: {e}", file=sys.stderr)
+        raise
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    merged: list[Path] = []
+    for pp in pairs:
+        src_id, tgt_id = pp["sampled_id"], pp["target_id"]
+        src_ts = pp.get("sampled_timestamp", src_id)
+        tgt_ts = pp.get("target_timestamp", tgt_id)
+        src = sampled_dir / f"{src_id}.jpg"
+        tgt = image_dir / f"{tgt_id}.jpg"
+        if not src.exists() or not tgt.exists():
+            print(f"[warn] matched pair {src_id}->{tgt_id}: missing image "
+                  f"({src} / {tgt}), skipped", file=sys.stderr)
+            continue
+        srcimg = cv2.imread(str(src))
+        tgtimg = cv2.imread(str(tgt))
+        if srcimg is None or tgtimg is None:
+            print(f"[warn] matched pair {src_id}->{tgt_id}: could not decode "
+                  f"image, skipped", file=sys.stderr)
+            continue
+        # Place both on a common canvas, side by side (src left, tgt right).
+        height = max(srcimg.shape[0], tgtimg.shape[0])
+        width = srcimg.shape[1] + tgtimg.shape[1]
+        canvas = np.full((height, width, 3), 128, dtype=np.uint8)
+        canvas[:srcimg.shape[0], :srcimg.shape[1]] = srcimg
+        canvas[:tgtimg.shape[0], srcimg.shape[1]:] = tgtimg
+        merged_path = out_dir / f"{src_ts}_{pp['parity']}__{tgt_ts}_{pp.get('target_parity', pp['parity'])}.jpg"
+        if not cv2.imwrite(str(merged_path), canvas):
+            print(f"[warn] could not write merged image: {merged_path}", file=sys.stderr)
+            continue
+        merged.append(merged_path)
+
+    if show and merged:
+        print("[info] opening cv2 window of matched pairs (press any key to advance, "
+              "ESC to quit)")
+        # 2. Create a named window with the resizable flag
+        window = "matched pairs (src | tgt)"
+        cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+
+        # 3. Explicitly resize the window dimensions (width, height)
+        cv2.resizeWindow(window, 800, 600)
+        for mp in merged:
+            img = cv2.imread(str(mp))
+            if img is None:
+                continue
+            cv2.imshow(window, img)
+            key = cv2.waitKey(0) & 0xFF
+            if key == 27:  # ESC
+                break
+        cv2.destroyAllWindows()
+    return merged
+
+
+def _copy_split_images(
+    pairs: list[dict[str, Any]],
+    sampled_dir: Path,
+    image_dir: Path,
+    out_dir: Path,
+) -> tuple[int, int]:
+    """Copy matched source and target images into two separate subfolders.
+
+    Creates ``out_dir/source/`` and ``out_dir/target/`` and copies each matched
+    pair's source image (from ``sampled_dir``) and target image (from
+    ``image_dir``) there as ``<timestamp_ns>.jpg`` (using the image's
+    ``timestamp_ns`` from the database). Existing files in the two subfolders
+    are cleared first. Returns ``(n_source, n_target)`` copied counts.
+    """
+    src_out = out_dir / "source"
+    tgt_out = out_dir / "target"
+    src_out.mkdir(parents=True, exist_ok=True)
+    tgt_out.mkdir(parents=True, exist_ok=True)
+    for d in (src_out, tgt_out):
+        for f in d.iterdir():
+            if f.is_file():
+                f.unlink()
+
+    n_src = n_tgt = 0
+    missing: list[int] = []
+    for pp in pairs:
+        sid, tid = pp["sampled_id"], pp["target_id"]
+        src_ts = pp.get("sampled_timestamp", sid)
+        tgt_ts = pp.get("target_timestamp", tid)
+        # L/R pairs share the same timestamp_ns, so append parity to the
+        # filename to avoid the second lens overwriting the first.
+        src_par = pp.get("parity", "")
+        tgt_par = pp.get("target_parity", "")
+        src_name = f"{src_ts}_{src_par}.jpg" if src_par else f"{src_ts}.jpg"
+        tgt_name = f"{tgt_ts}_{tgt_par}.jpg" if tgt_par else f"{tgt_ts}.jpg"
+        s = sampled_dir / f"{sid}.jpg"
+        t = image_dir / f"{tid}.jpg"
+        if s.exists():
+            shutil.copy2(s, src_out / src_name)
+            n_src += 1
+        else:
+            missing.append(sid)
+        if t.exists():
+            shutil.copy2(t, tgt_out / tgt_name)
+            n_tgt += 1
+        else:
+            missing.append(tid)
+    if missing:
+        print(f"[warn] {len(missing)} image(s) missing when copying to split dirs: "
+              f"{missing}", file=sys.stderr)
+    return n_src, n_tgt
+
+
+def _resample_images(
+    conn: sqlite3.Connection,
+    out_dir: Path,
+    src_dir: Path,
+    inspection: int,
+    interval_m: float,
+    start_index: int,
+    lens: str,
+    keep_existing: bool,
+) -> int:
+    """Populate ``out_dir`` with images sampled along ``inspection``'s trajectory.
+
+    Reuses ``sample_images_along_trajectory``'s pose clustering and greedy
+    arc-length sampling, then copies the picked <id>.jpg files from ``src_dir``
+    into ``out_dir`` (cleared first unless ``keep_existing``). Returns the number
+    of images copied, or -1 on error.
+    """
+    views, unpaired = sampler._load_pairs(conn, inspection)
+    if not views:
+        print(f"[error] no pose-bearing viewpoints in inspection {inspection}", file=sys.stderr)
+        return -1
+    if unpaired:
+        print(f"[warn] re-sampling inspection {inspection}: {len(unpaired)} unpaired "
+              f"(lens-ambiguous) image(s) excluded: {unpaired}", file=sys.stderr)
+
+    picked = sampler._sample_by_arclength(views, interval_m, start_index)
+
+    sampled_ids: list[int] = []
+    for v in picked:
+        if lens == "left":
+            sampled_ids.append(v["left_id"])
+        elif lens == "right":
+            if v["right_id"] is None:
+                print(f"[warn] view left_id={v['left_id']} has no right pair; skipping",
+                      file=sys.stderr)
+                continue
+            sampled_ids.append(v["right_id"])
+        else:
+            sampled_ids.append(v["left_id"])
+            if v["right_id"] is not None:
+                sampled_ids.append(v["right_id"])
+    sampled_ids = sorted(set(sampled_ids))
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if not keep_existing:
+        for f in out_dir.iterdir():
+            if f.is_file():
+                f.unlink()
+
+    copied = 0
+    missing: list[int] = []
+    for sid in sampled_ids:
+        src = src_dir / f"{sid}.jpg"
+        dst = out_dir / f"{sid}.jpg"
+        if not src.exists():
+            missing.append(sid)
+            continue
+        shutil.copy2(src, dst)
+        copied += 1
+    if missing:
+        print(f"[warn] {len(missing)} sampled id(s) missing in {src_dir}: {missing}",
+              file=sys.stderr)
+    return copied
+
+
+def _plot_trajectories(
+    conn: sqlite3.Connection,
+    source_inspection: int,
+    target_inspection: int,
+    pairs: list[dict[str, Any]] | None = None,
+    out_path: str | None = None,
+) -> None:
+    """Plot source vs target inspection trajectories (tf x/y) with matplotlib.
+
+    Each inspection's images are projected to the ground plane using their
+    ``tf_translation_x`` / ``tf_translation_y`` and drawn as a light gray
+    trajectory line. When ``pairs`` is given, each matched source-target pair
+    is drawn as two points sharing a single colour from a red-to-blue colormap
+    (``RdBu``), with a thin dashed line connecting them, so matched
+    correspondences are visually traceable. Unmatched points are omitted for
+    clarity. If ``out_path`` is given the figure is saved there instead of shown
+    interactively.
+    """
+    import matplotlib.pyplot as plt
+
+    def _pos(insp: int) -> tuple[list[float], list[float]]:
+        xs, ys = [], []
+        for row in conn.execute(
+            "SELECT tf_translation_x AS tx, tf_translation_y AS ty "
+            "FROM images WHERE inspection_id = ? "
+            "AND tf_translation_x IS NOT NULL ORDER BY id",
+            (insp,),
+        ):
+            xs.append(row["tx"])
+            ys.append(row["ty"])
+        return xs, ys
+
+    plt.figure(figsize=(12, 7))
+
+    # Draw both full trajectories as faint gray lines for context.
+    for insp in (source_inspection, target_inspection):
+        xs, ys = _pos(insp)
+        if xs:
+            plt.plot(xs, ys, "-", color="lightgray", markersize=0, linewidth=0.8,
+                     zorder=1)
+
+    # Draw matched pairs: each pair gets a unique colour from RdBu (red->blue).
+    if pairs:
+        # Build id -> (tx, ty) lookup for both inspections.
+        src_pos = {}
+        tgt_pos = {}
+        for row in conn.execute(
+            "SELECT id, inspection_id, tf_translation_x AS tx, tf_translation_y AS ty "
+            "FROM images WHERE tf_translation_x IS NOT NULL ORDER BY id",
+        ):
+            if row["inspection_id"] == source_inspection:
+                src_pos[row["id"]] = (row["tx"], row["ty"])
+            elif row["inspection_id"] == target_inspection:
+                tgt_pos[row["id"]] = (row["tx"], row["ty"])
+
+        n = len(pairs)
+        cmap = plt.cm.RdBu
+        colors = [cmap(i / max(1, n - 1)) for i in range(n)]
+        for idx, pp in enumerate(pairs):
+            sp = src_pos.get(pp["sampled_id"])
+            tp = tgt_pos.get(pp["target_id"])
+            if sp is None or tp is None:
+                continue
+            c = colors[idx]
+            # Connect matched pair with a thin dashed line.
+            plt.plot([sp[0], tp[0]], [sp[1], tp[1]], "--",
+                     color=c, linewidth=0.6, alpha=0.5, zorder=2)
+            plt.plot(sp[0], sp[1], "o", color=c, markersize=8, zorder=3)
+            plt.plot(tp[0], tp[1], "s", color=c, markersize=8, zorder=3)
+            # Annotate every 10th source point with its image id to avoid clutter.
+            if idx % 10 == 0:
+                plt.annotate(
+                    str(pp["sampled_id"]),
+                    xy=sp, xytext=(4, 4), textcoords="offset points",
+                    fontsize=7, color=c, zorder=4,
+                )
+
+        plt.plot([], [], "o", color="gray", markersize=8, label="source (circle)")
+        plt.plot([], [], "s", color="gray", markersize=8, label="target (square)")
+        plt.plot([], [], "--", color="gray", linewidth=0.6, label="matched link")
+        plt.title(f"Matched pairs: inspection {source_inspection} -> {target_inspection} "
+                  f"({n} pairs, red->blue, ids=source)")
+    else:
+        for insp, color, label in (
+            (source_inspection, "tab:blue", f"Inspection {source_inspection} (source)"),
+            (target_inspection, "tab:orange", f"Inspection {target_inspection} (target)"),
+        ):
+            xs, ys = _pos(insp)
+            if xs:
+                plt.plot(xs, ys, "-o", color=color, markersize=2, linewidth=1, label=label)
+        plt.title("Inspection trajectories (camera_init frame)")
+
+    plt.xlabel("tf x (m)")
+    plt.ylabel("tf y (m)")
+    plt.legend()
+    plt.grid(alpha=0.3)
+    plt.axis("equal")
+    plt.tight_layout()
+    if out_path:
+        plt.savefig(out_path, dpi=150)
+        print(f"[info] saved trajectory plot to {out_path}")
+    else:
+        plt.show()
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--db", default=str(_DEFAULT_DB), help="Path to inspection_v2_mtr_new.db")
+    p.add_argument(
+        "--sampled-dir",
+        default=str(_DEFAULT_SAMPLED_DIR),
+        help="Directory of <id>.jpg source images from inspection 1",
+    )
+    p.add_argument(
+        "--source-inspection",
+        type=int,
+        default=None,
+        help="Override: use ALL images of this inspection as the source instead of --sampled-dir",
+    )
+    p.add_argument(
+        "--sample-interval-m",
+        type=float,
+        default=None,
+        help="Re-populate --sampled-dir by sampling the source inspection trajectory "
+             "at this fixed arc-length interval (metres) via sample_images_along_trajectory.py",
+    )
+    p.add_argument(
+        "--sample-inspection",
+        type=int,
+        default=1,
+        help="Inspection id to sample from when --sample-interval-m is set (default 1)",
+    )
+    p.add_argument(
+        "--sample-start-index",
+        type=int,
+        default=0,
+        help="Index (in capture order) of the first sampled viewpoint (default 0)",
+    )
+    p.add_argument(
+        "--sample-lens",
+        choices=["left", "right", "both"],
+        default="left",
+        help="Which lens of each L/R pair to copy when sampling (default left). "
+             "Ignored when --select-pair is set (both lenses are taken).",
+    )
+    p.add_argument(
+        "--keep-sampled",
+        action="store_true",
+        help="When --sample-interval-m is set, do not clear --sampled-dir before writing",
+    )
+    p.add_argument("--target-inspection", type=int, default=2, help="Inspection id to match against (default 2)")
+    p.add_argument("--max-dist-m", type=float, default=1.5, help="Max translation (m) for a valid pair")
+    p.add_argument("--max-rot-deg", type=float, default=12.0,
+                   help="Max rotation (deg) for a same-lens pair (near 0 deg)")
+    p.add_argument("--rot-weight", type=float, default=0.1, help="m-per-deg rotation weight in the cost")
+    p.add_argument(
+        "--select-pair",
+        action="store_true",
+        help="Select both lenses of each sampled viewpoint (the full L+R pair) "
+             "as the source set, instead of only --sample-lens. Matching still "
+             "runs per parity class (L->L, R->R).",
+    )
+    p.add_argument("--json", dest="json_path", default=None, help="Write the pair list to this JSON file")
+    p.add_argument("--image-dir", default=str(_DEFAULT_IMAGE_DIR), help="Image folder for reported target file paths")
+    p.add_argument(
+        "--matched-dir",
+        default=None,
+        help="Write each matched pair as a merged image (src left, tgt right) "
+             "into this folder as <src_id>__<tgt_id>.jpg",
+    )
+    p.add_argument(
+        "--copy-split-dir",
+        default=None,
+        help="Copy the matched source and target images into two separate "
+             "subfolders (``source/`` and ``target/``) inside this directory, "
+             "each named <id>.jpg. Useful for feeding downstream tools that "
+             "expect flat per-side folders.",
+    )
+    p.add_argument(
+        "--run-name",
+        default=None,
+        help="Name of the run folder under inspection_database/runs/. If omitted, "
+             "auto-generated as '<src>vs<tgt>_<dist>m_<rot>deg' (e.g. '1vs2_0p75m_15deg'). "
+             "All outputs are auto-placed inside with clean names: insp<src>vs<tgt>/ "
+             "(merged images), split_pairs/ (source+target subfolders), pairs.json, "
+             "config.json, trajectory.png. Overrides --json/--matched-dir/--copy-split-dir/"
+             "--plot-out/--config-out when set.",
+    )
+    p.add_argument(
+        "--no-show",
+        action="store_true",
+        help="With --matched-dir, do not open the cv2 display window",
+    )
+    p.add_argument(
+        "--plot",
+        action="store_true",
+        help="Plot the source and target inspection trajectories with matplotlib",
+    )
+    p.add_argument(
+        "--plot-out",
+        default=None,
+        help="Save the trajectory plot to this file (default: show interactively)",
+    )
+    p.add_argument(
+        "--commit",
+        action="store_true",
+        help="Insert matched pairs into abnormal_detections (off by default; does not clobber existing rows)",
+    )
+    p.add_argument(
+        "--no-skip-existing",
+        dest="skip_existing",
+        action="store_false",
+        help="With --commit, also re-insert pairs that already exist in abnormal_detections",
+    )
+    p.add_argument(
+        "--config-out",
+        default=None,
+        help="Write a config.json with the parameters used to run this matching "
+             "session (db, inspections, gates, sampling, output paths, etc.)",
+    )
+    p.set_defaults(skip_existing=True)
+    args = p.parse_args(argv)
+
+    db_path = Path(args.db).resolve()
+    if not db_path.exists():
+        print(f"[error] database not found: {db_path}", file=sys.stderr)
+        return 2
+    sampled_dir = Path(args.sampled_dir).resolve()
+
+    # If --run-name is set, create a run folder and auto-route all outputs
+    # inside it with clean names.
+    run_dir: Path | None = None
+    if args.run_name:
+        run_name = args.run_name
+    else:
+        src_insp_for_name = (args.source_inspection if args.source_inspection is not None
+                             else args.sample_inspection)
+        run_name = f"{src_insp_for_name}vs{args.target_inspection}"
+        if args.sample_interval_m is not None:
+            run_name += f"_{_fmt_num(args.sample_interval_m)}m"
+        run_name += f"_{_fmt_num(args.max_dist_m)}m_{_fmt_num(args.max_rot_deg)}deg"
+    run_dir = _REPO_ROOT / INSPECTION_DIRECTORY / "runs" / run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    src_insp_for_name = (args.source_inspection if args.source_inspection is not None
+                         else args.sample_inspection)
+    label = f"insp{src_insp_for_name}vs{args.target_inspection}"
+    # Override output paths with clean names inside the run folder.
+    args.json_path = str(run_dir / "pairs.json")
+    args.config_out = str(run_dir / "config.json")
+    args.plot_out = str(run_dir / "trajectory.png")
+    args.matched_dir = str(run_dir / label)
+    args.copy_split_dir = str(run_dir / "split_pairs")
+    args.plot = True
+
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    if args.sample_interval_m is not None:
+        lens = "both" if args.select_pair else args.sample_lens
+        n = _resample_images(
+            conn,
+            sampled_dir,
+            Path(args.image_dir),
+            args.sample_inspection,
+            args.sample_interval_m,
+            args.sample_start_index,
+            lens,
+            args.keep_sampled,
+        )
+        if n < 0:
+            conn.close()
+            return 2
+        print(f"[info] sampled {n} image(s) from inspection {args.sample_inspection} "
+              f"at {args.sample_interval_m} m into {sampled_dir}"
+              f"{' (L+R pairs via --select-pair)' if args.select_pair else ''}")
+    try:
+        target_rows, tgt_unpaired = _load_inspection(conn, args.target_inspection)
+        if not target_rows:
+            print(f"[error] no pose-bearing L/R pairs in inspection {args.target_inspection}", file=sys.stderr)
+            return 2
+        if tgt_unpaired:
+            print(f"[info] target inspection {args.target_inspection}: {len(tgt_unpaired)} unpaired "
+                  f"image(s) excluded (ambiguous lens): {tgt_unpaired}", file=sys.stderr)
+
+        # Resolve the source set.
+        if args.source_inspection is not None:
+            source_rows, src_unpaired = _load_inspection(conn, args.source_inspection)
+            if src_unpaired:
+                print(f"[info] source inspection {args.source_inspection}: {len(src_unpaired)} unpaired "
+                      f"image(s) excluded (ambiguous lens): {src_unpaired}", file=sys.stderr)
+            src_label = f"all of inspection {args.source_inspection}"
+        else:
+            if not sampled_dir.exists():
+                print(f"[error] sampled dir not found: {sampled_dir}", file=sys.stderr)
+                return 2
+            source_ids = _load_sampled_ids(sampled_dir)
+            if not source_ids:
+                print(f"[error] no <id>.jpg files found in {sampled_dir}", file=sys.stderr)
+                return 2
+            src_insp = _resolve_source_inspection(conn, source_ids)
+            if src_insp is None:
+                print("[error] could not resolve which inspection the sampled images belong to", file=sys.stderr)
+                return 2
+            # L/R is assigned by pose-clustering within the source inspection.
+            all_src, src_unpaired = _load_inspection(conn, src_insp)
+            id_to_row = {r["id"]: r for r in all_src}
+            unpaired_set = set(src_unpaired)
+            source_rows: list[dict[str, Any]] = []
+            missing: list[int] = []
+            ambiguous: list[int] = []
+            for sid in source_ids:
+                r = id_to_row.get(sid)
+                if r is not None:
+                    source_rows.append(r)
+                elif sid in unpaired_set:
+                    ambiguous.append(sid)
+                else:
+                    missing.append(sid)
+            if missing:
+                print(f"[warn] {len(missing)} sampled id(s) not found in inspection "
+                      f"{src_insp} (skipped): {missing}", file=sys.stderr)
+            if ambiguous:
+                print(f"[warn] {len(ambiguous)} sampled id(s) are unpaired in inspection "
+                      f"{src_insp} (lens ambiguous, skipped): {ambiguous}", file=sys.stderr)
+            src_label = f"{len(source_rows)} sampled image(s) from inspection {src_insp}"
+
+        by_parity_src = {"L": [r for r in source_rows if r["parity"] == "L"],
+                         "R": [r for r in source_rows if r["parity"] == "R"]}
+        by_parity_tgt = {"L": [r for r in target_rows if r["parity"] == "L"],
+                         "R": [r for r in target_rows if r["parity"] == "R"]}
+
+        print(f"[info] db: {db_path}")
+        print(f"[info] source: {src_label}")
+        print(f"[info] target: inspection {args.target_inspection} "
+              f"({len(target_rows)} imgs: {len(by_parity_tgt['L'])} L / {len(by_parity_tgt['R'])} R)")
+        print(f"[info] source parity: {len(by_parity_src['L'])} L / {len(by_parity_src['R'])} R")
+        print(f"[info] gate: max_dist={args.max_dist_m} m, max_rot={args.max_rot_deg} deg, "
+              f"rot_weight={args.rot_weight}")
+
+        all_pairs = _match_all(
+            source_rows, target_rows,
+            args.max_dist_m, args.max_rot_deg,
+            args.rot_weight,
+        )
+        matched_src_ids: set[int] = {pp["sampled_id"] for pp in all_pairs}
+        print(f"[info] matched {len(all_pairs)}/{len(source_rows)} source image(s) "
+              f"against {len(target_rows)} candidate(s)")
+
+        # Candidate pool for unmatched diagnostics.
+        diag_tgt = target_rows
+
+        # Diagnostics for unmatched sources: nearest candidate distance.
+        unmatched = [r for r in source_rows if r["id"] not in matched_src_ids]
+        if unmatched:
+            print(f"\n[info] {len(unmatched)} unmatched source image(s) - "
+                  f"nearest candidate:")
+            for r in sorted(unmatched, key=lambda x: x["id"]):
+                nt, nr, nid, mt = _nearest_distance(r, diag_tgt)
+                print(f"  src id={r['id']:>4} ({r['parity']})  nearest target id={nid}  "
+                      f"trans={nt:.3f} m  rot={nr:.2f} deg  match_type={mt}  "
+                      f"(over gate -> no match)")
+
+        all_pairs.sort(key=lambda pp: pp["sampled_id"])
+
+        # Enrich pairs with timestamps from the database (used for output
+        # filenames and JSON keys). Parity (L/R) is kept for reference.
+        ts_lookup = _load_timestamps(conn)
+        for pp in all_pairs:
+            pp["sampled_timestamp"] = ts_lookup.get(pp["sampled_id"])
+            pp["target_timestamp"] = ts_lookup.get(pp["target_id"])
+
+        if args.plot:
+            src_insp = args.sample_inspection if args.sample_interval_m is not None \
+                else (args.source_inspection if args.source_inspection is not None
+                      else args.sample_inspection)
+            _plot_trajectories(conn, src_insp, args.target_inspection,
+                               pairs=all_pairs, out_path=args.plot_out)
+
+        print("\n=== matched pairs ===")
+        print(f"{'src_id':>7} {'parity':>6} {'tgt_id':>7} {'tgt_par':>7} {'type':>9} {'trans_m':>9} {'rot_deg':>8} {'cost':>7}")
+        for pp in all_pairs:
+            print(f"{pp['sampled_id']:>7} {pp['parity']:>6} {pp['target_id']:>7} {pp['target_parity']:>7} "
+                  f"{pp['match_type']:>9} {pp['translation_m']:>9.3f} {pp['rotation_deg']:>8.2f} {pp['cost']:>7.3f}")
+
+        if args.json_path:
+            # Only matched pairs go into the JSON; unmatched sources are
+            # reported in the console/summary but excluded here.
+            json_pairs = []
+            src_insp_val = (args.source_inspection if args.source_inspection is not None
+                            else args.sample_inspection)
+            for pp in all_pairs:
+                jp = {
+                    "source_inspection": src_insp_val,
+                    "target_inspection": args.target_inspection,
+                    "sampled_id": pp["sampled_id"],
+                    "target_id": pp["target_id"],
+                    "parity": pp["parity"],
+                    "target_parity": pp["target_parity"],
+                    "match_type": pp["match_type"],
+                    "sampled_timestamp": pp.get("sampled_timestamp"),
+                    "target_timestamp": pp.get("target_timestamp"),
+                }
+                json_pairs.append(jp)
+            Path(args.json_path).write_text(json.dumps(json_pairs, indent=2))
+            print(f"[info] wrote {len(json_pairs)} matched pair(s) to {args.json_path}")
+
+        if args.matched_dir:
+            matched_dir = Path(args.matched_dir).resolve()
+            matched_dir.mkdir(parents=True, exist_ok=True)
+            merged = _copy_matched_images(
+                all_pairs, sampled_dir, Path(args.image_dir), matched_dir,
+                show=not args.no_show,
+            )
+            print(f"[info] wrote {len(merged)} merged pair image(s) to {matched_dir}")
+            if merged and args.no_show:
+                print("[info] --no-show set: skipping cv2 display window")
+
+        if args.copy_split_dir:
+            split_dir = Path(args.copy_split_dir).resolve()
+            n_src, n_tgt = _copy_split_images(
+                all_pairs, sampled_dir, Path(args.image_dir), split_dir,
+            )
+            print(f"[info] copied {n_src} source / {n_tgt} target image(s) to "
+                  f"{split_dir / 'source'} and {split_dir / 'target'}")
+
+        # Results summary: matching stats + names of unmatched images.
+        print("\n=== results summary ===")
+        print(f"  source images:      {len(source_rows)}")
+        print(f"  matched pairs:      {len(all_pairs)}")
+        print(f"  unmatched images:   {len(unmatched)}")
+        if all_pairs:
+            t = [pp["translation_m"] for pp in all_pairs]
+            r = [pp["rotation_deg"] for pp in all_pairs]
+            print(f"  translation (m):   min={min(t):.3f} med={sorted(t)[len(t)//2]:.3f} "
+                  f"max={max(t):.3f}")
+            print(f"  rotation (deg):    min={min(r):.2f} med={sorted(r)[len(r)//2]:.2f} "
+                  f"max={max(r):.2f}")
+        if unmatched:
+            print("\n  unmatched image(s) (name -> id | nearest cost):")
+            for r in sorted(unmatched, key=lambda x: x["id"]):
+                nt, nr, nid, mt = _nearest_distance(r, diag_tgt)
+                cost = nt + args.rot_weight * nr
+                name = r["filename"] or f"{r['id']}.jpg"
+                print(f"    {name}  (id={r['id']}, parity={r['parity']}, "
+                      f"nearest tgt={nid}, match_type={mt}, trans={nt:.3f} m, "
+                      f"rot={nr:.2f} deg, cost={cost:.3f})")
+
+        if args.commit:
+            n = _commit_pairs(conn, all_pairs, args.skip_existing)
+            mode = "inserted" if args.skip_existing else "inserted (incl. duplicates)"
+            print(f"[info] {n} pair(s) {mode} into abnormal_detections")
+
+        if args.config_out:
+            config = {
+                "db": str(db_path),
+                "image_dir": args.image_dir,
+                "sampled_dir": str(sampled_dir),
+                "source_inspection": args.source_inspection,
+                "target_inspection": args.target_inspection,
+                "sample_inspection": args.sample_inspection,
+                "sample_interval_m": args.sample_interval_m,
+                "sample_start_index": args.sample_start_index,
+                "sample_lens": "both" if args.select_pair else args.sample_lens,
+                "select_pair": args.select_pair,
+                "keep_sampled": args.keep_sampled,
+                "max_dist_m": args.max_dist_m,
+                "max_rot_deg": args.max_rot_deg,
+                "rot_weight": args.rot_weight,
+                "json_path": args.json_path,
+                "matched_dir": args.matched_dir,
+                "copy_split_dir": args.copy_split_dir,
+                "plot": args.plot,
+                "plot_out": args.plot_out,
+                "commit": args.commit,
+                "skip_existing": args.skip_existing,
+                "run_name": args.run_name,
+                "run_dir": str(run_dir) if run_dir else None,
+                "results": {
+                    "source_images": len(source_rows),
+                    "matched_pairs": len(all_pairs),
+                    "unmatched_images": len(unmatched),
+                },
+            }
+            Path(args.config_out).write_text(json.dumps(config, indent=2))
+            print(f"[info] wrote config to {args.config_out}")
+    finally:
+        conn.close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
