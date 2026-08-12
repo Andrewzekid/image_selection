@@ -235,18 +235,6 @@ pip install -r requirements.txt
 # or just the subset needed here:
 pip install "numpy>=2.1.3,<2.3" "opencv-python>=4.10.0" "matplotlib>=3.7"
 ```
-
-Run with the backend venv so the libraries are on the path:
-
-```bash
-../backend/.venv/bin/python <script>.py ...
-```
-
-The full `requirements.txt` also pins backend web/ASR/TTS dependencies
-(fastapi, uvicorn, funasr, faster-whisper, piper-tts, rerun-sdk, etc.) that
-these image-selection scripts do **not** use, but are required by the rest of
-the repo.
-
 ## Notes
 
 - `_REPO_ROOT` is resolved from each script's location, so commands work from
