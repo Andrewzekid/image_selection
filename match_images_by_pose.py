@@ -12,15 +12,16 @@ Both inspections live in the shared ``camera_init`` (FastLIO) global frame and
 traverse the same route, so poses are directly comparable - no cross-run
 alignment is needed.
 
-Matching is optimal 1:1 via the Hungarian algorithm
-(``scipy.optimize.linear_sum_assignment``) on a cost of
+Matching is per-source nearest feasible candidate: each source independently
+picks its lowest-cost feasible target, so the same target may be matched by
+multiple sources (one-to-many on the target side). Cost is
 
     cost = translation_m + rot_weight * rotation_deg
 
 with a threshold gate (``max_dist_m`` / ``max_rot_deg``) that drops pairs whose
 nearest available partner is actually a different viewpoint.
 
-Run with the backend venv so scipy/numpy are available, e.g.::
+Run with the backend venv so numpy is available, e.g.::
 
     python backend/scripts/match_images_by_pose.py \
         --target-inspection 2 --json pairs.json
@@ -30,8 +31,8 @@ To sample the source images on the fly at a fixed distance interval (via
 existing ``--sampled-dir``, add ``--sample-interval-m`` (and the inspection to
 sample from with ``--sample-inspection``)
 
-Match L+R pairs from inspection 1 against target inspection 3 at 1.25 m
-sampling with a tight 0.3 m translation / 10 deg rotation gate, using the
+Match L+R pairs from inspection 1 against target inspection 3 at 1 m
+sampling with a tight 0.5 m translation / 10 deg rotation gate (candidate images outside of this limit are discarded), using the
 database and images inside ``inspection_database/`` and saving the
 matched-pairs JSON, the merged side-by-side matched images, the split
 source/target folders, and the trajectory plot all under
@@ -42,7 +43,7 @@ source/target folders, and the trajectory plot all under
         --image-dir "inspection_database/outputs/images" \
         --sampled-dir "inspection_database/sampled_images" \
         --target-inspection 3 --sample-inspection 1 \
-        --sample-interval-m 1.25 --max-dist-m 0.3 --max-rot-deg 10 \
+        --sample-interval-m 1 --max-dist-m 0.5 --max-rot-deg 10 \
         --select-pair \
         --plot --plot-out "inspection_database/trajectory_insp1_vs_3.png" \
         --matched-dir "inspection_database/matched_pairs_tight" --no-show \
@@ -63,7 +64,6 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from scipy.optimize import linear_sum_assignment
 
 import sample_images_along_trajectory as sampler
 
@@ -171,10 +171,13 @@ def _match_all(
     max_rot_deg: float,
     rot_weight: float,
 ) -> list[dict[str, Any]]:
-    """Optimal 1:1 assignment of sources -> candidates with same-lens gating.
+    """Per-source nearest feasible candidate (targets may be reused).
 
-    Only same-lens pairs (L->L, R->R) are accepted, when ``rot <= max_rot_deg``
-    (near 0). Cross-lens matching (L->R, R->L) is not supported.
+    Each source independently picks its lowest-cost feasible target. The same
+    target can therefore be matched by multiple sources (one-to-many on the
+    target side). Only same-lens pairs (L->L, R->R) are accepted, when
+    ``rot <= max_rot_deg`` (near 0). Cross-lens matching (L->R, R->L) is not
+    supported.
 
     Cost is ``trans + rot_weight * rot``.
 
@@ -202,12 +205,12 @@ def _match_all(
     rot_ok = same_lens & (rot <= max_rot_deg)
 
     infeasible = (trans > max_dist_m) | ~rot_ok
-    cost = np.where(infeasible, cost.max() + 1.0e6, cost)
+    cost = np.where(infeasible, np.inf, cost)
 
-    row_ind, col_ind = linear_sum_assignment(cost)
     pairs: list[dict[str, Any]] = []
-    for i, j in zip(row_ind, col_ind):
-        if infeasible[i, j]:
+    for i in range(len(sources)):
+        j = int(np.argmin(cost[i]))
+        if not np.isfinite(cost[i, j]):
             continue
         s, c = sources[i], candidates[j]
         pairs.append(
