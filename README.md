@@ -24,8 +24,17 @@ python sample_images_along_trajectory.py \
 
 For each source image (default: the `<id>.jpg` files in `--sampled-dir`, a
 subset of inspection 1), finds the image in a target inspection taken from
-the same viewpoint by comparing camera pose (`tf_translation_{x,y,z}` +
-quaternion `tf_rotation_{x,y,z,w}`) stored on the `images` table.
+the same viewpoint by comparing the **camera world pose** stored on the
+`images` table: `cam_tf_translation_{x,y,z}` + quaternion
+`cam_tf_rotation_{x,y,z,w}`. These are per-frame camera poses in the shared
+`camera_init` (FastLIO) global frame; L and R of the same rig have different
+`cam_tf_*` values (~108-128° apart in rotation), so cross-lens siblings
+don't collapse to rot=0.
+
+L/R lens assignment still clusters on the **body-frame** pose (`tf_*` +
+`timestamp_ns`), since the two cameras of a stereo rig share one body pose.
+The default database is `inspection_database/complete2/inspection_v2.db`
+(where `cam_tf_*` is per-frame); pass `--db` to use another DB.
 
 **Matching mode:** per-source nearest feasible candidate. Each source
 independently picks its lowest-cost feasible target, so the **same target may

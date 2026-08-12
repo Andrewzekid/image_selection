@@ -56,9 +56,9 @@ def _load_pairs(
                tf_translation_x AS tx, tf_translation_y AS ty, tf_translation_z AS tz,
                tf_rotation_x AS rx, tf_rotation_y AS ry,
                tf_rotation_z AS rz, tf_rotation_w AS rw
-        FROM images
-        WHERE inspection_id = ? AND tf_translation_x IS NOT NULL
-                                  AND tf_rotation_w IS NOT NULL
+         FROM images
+         WHERE inspection_id = ? AND tf_translation_x IS NOT NULL
+                                   AND tf_rotation_w IS NOT NULL
         ORDER BY id
         """,
         (inspection_id,),

@@ -4,9 +4,9 @@
 For each image in a *source* set (by default the files in
 ``MTR Inspection Database/sampled_images/``, which are a subset of inspection 1,
 named ``<image_id>.jpg``), find the image in a *target* inspection (default 2)
-that was taken from the same viewpoint, by comparing the camera pose stored on
-the ``images`` table (``tf_translation_{x,y,z}`` + quaternion
-``tf_rotation_{x,y,z,w}``).
+that was taken from the same viewpoint by comparing the camera pose stored on the
+``images`` table (``cam_tf_translation_{x,y,z}`` + quaternion
+``cam_tf_rotation_{x,y,z,w}``).
 
 Both inspections live in the shared ``camera_init`` (FastLIO) global frame and
 traverse the same route, so poses are directly comparable - no cross-run
@@ -71,9 +71,9 @@ import sample_images_along_trajectory as sampler
 # so defaults resolve correctly regardless of the current working directory.
 INSPECTION_DIRECTORY = "inspection_database"
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-_DEFAULT_DB = _REPO_ROOT / INSPECTION_DIRECTORY / "inspection_v2.db"
+_DEFAULT_DB = _REPO_ROOT / INSPECTION_DIRECTORY / "complete2" / "inspection_v2.db"
 _DEFAULT_SAMPLED_DIR = _REPO_ROOT / INSPECTION_DIRECTORY / "sampled_images"
-_DEFAULT_IMAGE_DIR = _REPO_ROOT / INSPECTION_DIRECTORY / "outputs" / "images"
+_DEFAULT_IMAGE_DIR = _REPO_ROOT / INSPECTION_DIRECTORY / "complete2" / "outputs" / "images"
 
 
 def _fmt_num(x: float) -> str:
@@ -87,49 +87,61 @@ def _load_inspection(
 ) -> tuple[list[dict[str, Any]], list[int]]:
     """All pose-bearing images of one inspection with a known lens, ordered by id.
 
-    L/R is assigned by clustering images on their identical pose + timestamp:
-    consecutive captures form a left/right pair from the *same* pose, sharing
-    an identical pose (translation AND quaternion) and the same ``timestamp_ns``.
-    Every size-2 cluster is one L/R pair, with the lower id = LEFT. Size-1
-    clusters are unpaired frames whose lens is ambiguous; they are excluded
-    from matching.
+    L/R is assigned by clustering images on their identical **body-frame** pose
+    (``tf_*``) + timestamp: the two cameras of a stereo rig share one body
+    pose, so consecutive captures with identical ``tf_translation_*`` /
+    ``tf_rotation_*`` and the same ``timestamp_ns`` form an L/R pair (lower id
+    = LEFT). Size-1 clusters are unpaired frames whose lens is ambiguous and
+    are excluded from matching.
 
-    Returns ``(rows, unpaired_ids)``. Each row gets a ``parity`` of "L" or "R".
+    The pose used for matching is the **camera world pose** stored in the
+    ``cam_tf_*`` columns (per-frame translation + quaternion of the camera
+    in the world frame). L and R of the same rig have different ``cam_tf_*``
+    values (~108-128 deg apart in rotation), so a cross-lens match between
+    siblings no longer collapses to rot=0.
+
+    Returns ``(rows, unpaired_ids)``. Each row gets a ``parity`` of "L" or "R"
+    and ``tx/ty/tz/rx/ry/rz/rw`` holding the camera world pose.
     """
     raw = conn.execute(
         """
         SELECT id, inspection_id, filename, timestamp_ns,
-               tf_translation_x AS tx, tf_translation_y AS ty, tf_translation_z AS tz,
-               tf_rotation_x AS rx, tf_rotation_y AS ry,
-               tf_rotation_z AS rz, tf_rotation_w AS rw
-        FROM images
-        WHERE inspection_id = ? AND tf_translation_x IS NOT NULL
-                                   AND tf_rotation_w IS NOT NULL
-        ORDER BY id
-        """,
+               tf_translation_x  AS btx, tf_translation_y  AS bty, tf_translation_z  AS btz,
+               tf_rotation_x     AS brx, tf_rotation_y     AS bry,
+               tf_rotation_z     AS brz, tf_rotation_w     AS brw,
+               cam_tf_translation_x AS tx, cam_tf_translation_y AS ty, cam_tf_translation_z AS tz,
+               cam_tf_rotation_x    AS rx, cam_tf_rotation_y    AS ry,
+               cam_tf_rotation_z    AS rz, cam_tf_rotation_w    AS rw
+         FROM images
+         WHERE inspection_id = ? AND tf_translation_x IS NOT NULL
+                                    AND tf_rotation_w IS NOT NULL
+                                    AND cam_tf_translation_x IS NOT NULL
+                                    AND cam_tf_rotation_w IS NOT NULL
+         ORDER BY id
+         """,
         (inspection_id,),
     ).fetchall()
 
     rows: list[dict[str, Any]] = []
     unpaired: list[int] = []
 
-    # Group consecutive rows by identical (timestamp_ns, translation, rotation).
-    # Consecutive captures sharing the same pose + timestamp form an L/R pair.
+    # Group consecutive rows by identical (timestamp_ns, BODY-frame pose).
+    # The body pose is identical for the L/R pair of one rig; the per-camera
+    # pose (cam_tf_*, aliased as tx/..rw above) differs and is matched on later.
     i = 0
     while i < len(raw):
         d = dict(raw[i])
-        # Look ahead to find all rows with identical pose + timestamp.
         j = i + 1
         while j < len(raw):
             nxt = raw[j]
             if (nxt["timestamp_ns"] == d["timestamp_ns"]
-                    and nxt["tx"] == d["tx"]
-                    and nxt["ty"] == d["ty"]
-                    and nxt["tz"] == d["tz"]
-                    and nxt["rx"] == d["rx"]
-                    and nxt["ry"] == d["ry"]
-                    and nxt["rz"] == d["rz"]
-                    and nxt["rw"] == d["rw"]):
+                    and nxt["btx"] == d["btx"]
+                    and nxt["bty"] == d["bty"]
+                    and nxt["btz"] == d["btz"]
+                    and nxt["brx"] == d["brx"]
+                    and nxt["bry"] == d["bry"]
+                    and nxt["brz"] == d["brz"]
+                    and nxt["brw"] == d["brw"]):
                 j += 1
             else:
                 break
@@ -533,7 +545,7 @@ def _plot_trajectories(
     """Plot source vs target inspection trajectories (tf x/y) with matplotlib.
 
     Each inspection's images are projected to the ground plane using their
-    ``tf_translation_x`` / ``tf_translation_y`` and drawn as a light gray
+    ``cam_tf_translation_x`` / ``cam_tf_translation_y`` and drawn as a light gray
     trajectory line. When ``pairs`` is given, each matched source-target pair
     is drawn as two points sharing a single colour from a red-to-blue colormap
     (``RdBu``), with a thin dashed line connecting them, so matched
@@ -546,9 +558,9 @@ def _plot_trajectories(
     def _pos(insp: int) -> tuple[list[float], list[float]]:
         xs, ys = [], []
         for row in conn.execute(
-            "SELECT tf_translation_x AS tx, tf_translation_y AS ty "
+            "SELECT cam_tf_translation_x AS tx, cam_tf_translation_y AS ty "
             "FROM images WHERE inspection_id = ? "
-            "AND tf_translation_x IS NOT NULL ORDER BY id",
+            "AND cam_tf_translation_x IS NOT NULL ORDER BY id",
             (insp,),
         ):
             xs.append(row["tx"])
@@ -570,8 +582,8 @@ def _plot_trajectories(
         src_pos = {}
         tgt_pos = {}
         for row in conn.execute(
-            "SELECT id, inspection_id, tf_translation_x AS tx, tf_translation_y AS ty "
-            "FROM images WHERE tf_translation_x IS NOT NULL ORDER BY id",
+            "SELECT id, inspection_id, cam_tf_translation_x AS tx, cam_tf_translation_y AS ty "
+            "FROM images WHERE cam_tf_translation_x IS NOT NULL ORDER BY id",
         ):
             if row["inspection_id"] == source_inspection:
                 src_pos[row["id"]] = (row["tx"], row["ty"])

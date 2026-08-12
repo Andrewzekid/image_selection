@@ -58,11 +58,11 @@ def _load_inspection_points(
     rows = conn.execute(
         """
         SELECT id, tf_translation_x AS tx, tf_translation_y AS ty, timestamp_ns
-        FROM images
-        WHERE inspection_id = ?
-          AND tf_translation_x IS NOT NULL
-          AND tf_translation_y IS NOT NULL
-          AND timestamp_ns IS NOT NULL
+         FROM images
+         WHERE inspection_id = ?
+           AND tf_translation_x IS NOT NULL
+           AND tf_translation_y IS NOT NULL
+           AND timestamp_ns IS NOT NULL
         ORDER BY id
         """,
         (inspection_id,),
