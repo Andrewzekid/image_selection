@@ -67,10 +67,10 @@ import numpy as np
 
 import sample_images_along_trajectory as sampler
 
-# Repo root is two levels up from this script (backend/scripts/ -> repo root),
+# Repo root is one level up from this script (image_selection/ -> repo root),
 # so defaults resolve correctly regardless of the current working directory.
 INSPECTION_DIRECTORY = "inspection_database"
-_REPO_ROOT = Path(__file__).resolve().parents[2]
+_REPO_ROOT = Path(__file__).resolve().parents[1]
 _DEFAULT_DB = _REPO_ROOT / INSPECTION_DIRECTORY / "inspection_v2.db"
 _DEFAULT_SAMPLED_DIR = _REPO_ROOT / INSPECTION_DIRECTORY / "sampled_images"
 _DEFAULT_IMAGE_DIR = _REPO_ROOT / INSPECTION_DIRECTORY / "outputs" / "images"
@@ -170,16 +170,22 @@ def _match_all(
     max_dist_m: float,
     max_rot_deg: float,
     rot_weight: float,
+    cross_lens_penalty: float = 0.1,
 ) -> list[dict[str, Any]]:
     """Per-source nearest feasible candidate (targets may be reused).
 
     Each source independently picks its lowest-cost feasible target. The same
     target can therefore be matched by multiple sources (one-to-many on the
-    target side). Only same-lens pairs (L->L, R->R) are accepted, when
-    ``rot <= max_rot_deg`` (near 0). Cross-lens matching (L->R, R->L) is not
-    supported.
+    target side).
 
-    Cost is ``trans + rot_weight * rot``.
+    Both same-lens (L->L, R->R) and cross-lens (L->R, R->L) pairs are
+    considered. A small ``cross_lens_penalty`` (in metre-equivalent cost
+    units) is added to cross-lens pairs so same-lens wins ties - this also
+    prevents a source from matching its own L/R sibling, which shares an
+    identical pose (trans=0, rot=0) and would otherwise always win.
+
+    Cost is ``trans + rot_weight * rot`` (plus ``cross_lens_penalty`` for
+    cross-lens pairs).
 
     Returns one dict per kept pair. Sources with no acceptable candidate are
     omitted; the caller reports them.
@@ -200,10 +206,11 @@ def _match_all(
     same_lens = (src_lens == tgt_lens)  # (N, M) bool
 
     cost = trans + rot_weight * rot
+    # Add a small penalty to cross-lens pairs so same-lens wins ties.
+    cost = np.where(same_lens, cost, cost + cross_lens_penalty)
 
-    # Gate: same lens only, rotation near 0.
-    rot_ok = same_lens & (rot <= max_rot_deg)
-
+    # Gate: rotation near 0 (both same- and cross-lens). Translation within max_dist_m.
+    rot_ok = rot <= max_rot_deg
     infeasible = (trans > max_dist_m) | ~rot_ok
     cost = np.where(infeasible, np.inf, cost)
 
@@ -219,7 +226,7 @@ def _match_all(
                 "target_id": int(c["id"]),
                 "parity": s["parity"],
                 "target_parity": c["parity"],
-                "match_type": "same_lens",
+                "match_type": "same_lens" if same_lens[i, j] else "cross_lens",
                 "translation_m": float(trans[i, j]),
                 "rotation_deg": float(rot[i, j]),
                 "cost": float(cost[i, j]),
@@ -229,26 +236,28 @@ def _match_all(
 
 
 def _nearest_distance(
-    src: dict[str, Any], candidates: list[dict[str, Any]]
+    src: dict[str, Any], candidates: list[dict[str, Any]],
+    cross_lens_penalty: float = 0.1,
 ) -> tuple[float, float, int | None, str | None]:
     """Nearest candidate's (translation_m, rotation_deg, id, match_type) for diagnostics.
 
-    Considers only same-lens candidates, returns the one with the smallest
-    translation distance.
+    Considers all candidates (same- and cross-lens), returns the one with the
+    lowest ``trans + cross_lens_penalty * (not same lens)`` cost so the
+    diagnostic reflects the same logic as the matcher.
     """
     if not candidates:
         return float("inf"), float("inf"), None, None
-    same = [c for c in candidates if c["parity"] == src["parity"]]
-    if not same:
-        return float("inf"), float("inf"), None, None
     P = np.array([[src["tx"], src["ty"], src["tz"]]], dtype=float)
-    C = np.array([[c["tx"], c["ty"], c["tz"]] for c in same], dtype=float)
+    C = np.array([[c["tx"], c["ty"], c["tz"]] for c in candidates], dtype=float)
     qP = np.array([[src["rx"], src["ry"], src["rz"], src["rw"]]], dtype=float)
-    qC = np.array([[c["rx"], c["ry"], c["rz"], c["rw"]] for c in same], dtype=float)
+    qC = np.array([[c["rx"], c["ry"], c["rz"], c["rw"]] for c in candidates], dtype=float)
     trans = np.sqrt(((P[:, None, :] - C[None, :, :]) ** 2).sum(-1))[0]
     rot = _quat_rotation_deg(qP, qC)[0]
-    j = int(np.argmin(trans))
-    return float(trans[j]), float(rot[j]), int(same[j]["id"]), "same_lens"
+    same = np.array([c["parity"] == src["parity"] for c in candidates], dtype=bool)
+    cost = trans + np.where(same, 0.0, cross_lens_penalty)
+    j = int(np.argmin(cost))
+    mt = "same_lens" if same[j] else "cross_lens"
+    return float(trans[j]), float(rot[j]), int(candidates[j]["id"]), mt
 
 
 def _load_sampled_ids(sampled_dir: Path) -> list[int]:
@@ -667,8 +676,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--target-inspection", type=int, default=2, help="Inspection id to match against (default 2)")
     p.add_argument("--max-dist-m", type=float, default=1.5, help="Max translation (m) for a valid pair")
     p.add_argument("--max-rot-deg", type=float, default=12.0,
-                   help="Max rotation (deg) for a same-lens pair (near 0 deg)")
-    p.add_argument("--rot-weight", type=float, default=0.1, help="m-per-deg rotation weight in the cost")
+                   help="Max rotation (deg) for a matched pair (near 0 deg)")
+    p.add_argument("--rot-weight", type=float, default=0.15, help="m-per-deg rotation weight in the cost")
+    p.add_argument(
+        "--cross-lens-penalty",
+        type=float,
+        default=0.1,
+        help="Cost (in metre-equivalent units) added to cross-lens (L->R, R->L) "
+             "pairs so same-lens wins ties. Set to a large value to effectively "
+             "disable cross-lens matching (default 0.1).",
+    )
     p.add_argument(
         "--select-pair",
         action="store_true",
@@ -850,12 +867,13 @@ def main(argv: list[str] | None = None) -> int:
               f"({len(target_rows)} imgs: {len(by_parity_tgt['L'])} L / {len(by_parity_tgt['R'])} R)")
         print(f"[info] source parity: {len(by_parity_src['L'])} L / {len(by_parity_src['R'])} R")
         print(f"[info] gate: max_dist={args.max_dist_m} m, max_rot={args.max_rot_deg} deg, "
-              f"rot_weight={args.rot_weight}")
+              f"rot_weight={args.rot_weight}, cross_lens_penalty={args.cross_lens_penalty}")
 
         all_pairs = _match_all(
             source_rows, target_rows,
             args.max_dist_m, args.max_rot_deg,
             args.rot_weight,
+            args.cross_lens_penalty,
         )
         matched_src_ids: set[int] = {pp["sampled_id"] for pp in all_pairs}
         print(f"[info] matched {len(all_pairs)}/{len(source_rows)} source image(s) "
@@ -870,7 +888,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"\n[info] {len(unmatched)} unmatched source image(s) - "
                   f"nearest candidate:")
             for r in sorted(unmatched, key=lambda x: x["id"]):
-                nt, nr, nid, mt = _nearest_distance(r, diag_tgt)
+                nt, nr, nid, mt = _nearest_distance(r, diag_tgt, args.cross_lens_penalty)
                 print(f"  src id={r['id']:>4} ({r['parity']})  nearest target id={nid}  "
                       f"trans={nt:.3f} m  rot={nr:.2f} deg  match_type={mt}  "
                       f"(over gate -> no match)")
@@ -953,7 +971,7 @@ def main(argv: list[str] | None = None) -> int:
         if unmatched:
             print("\n  unmatched image(s) (name -> id | nearest cost):")
             for r in sorted(unmatched, key=lambda x: x["id"]):
-                nt, nr, nid, mt = _nearest_distance(r, diag_tgt)
+                nt, nr, nid, mt = _nearest_distance(r, diag_tgt, args.cross_lens_penalty)
                 cost = nt + args.rot_weight * nr
                 name = r["filename"] or f"{r['id']}.jpg"
                 print(f"    {name}  (id={r['id']}, parity={r['parity']}, "
@@ -981,6 +999,7 @@ def main(argv: list[str] | None = None) -> int:
                 "max_dist_m": args.max_dist_m,
                 "max_rot_deg": args.max_rot_deg,
                 "rot_weight": args.rot_weight,
+                "cross_lens_penalty": args.cross_lens_penalty,
                 "json_path": args.json_path,
                 "matched_dir": args.matched_dir,
                 "copy_split_dir": args.copy_split_dir,
