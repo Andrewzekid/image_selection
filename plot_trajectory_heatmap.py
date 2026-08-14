@@ -99,7 +99,7 @@ def _load_inspection_points(
          """,
         (inspection_id,),
     ).fetchall()
-    print(f"[info] inspection {inspection_id}: loaded {len(raw)} pose-bearing points. Sample raw:{raw[0]}")
+
     def _pt(r):
         return (int(r["id"]), float(r[h_col]), float(r[v_col]), int(r["timestamp_ns"]))
 
