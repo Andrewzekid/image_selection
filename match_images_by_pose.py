@@ -12,14 +12,25 @@ Both inspections live in the shared ``camera_init`` (FastLIO) global frame and
 traverse the same route, so poses are directly comparable - no cross-run
 alignment is needed.
 
+By default the source set is read from the database: the ``gt_image`` ids of
+``abnormal_detections`` rows whose ``inspection_image`` is still NULL (i.e. gt
+images not yet matched). Use ``--no-gt-db`` to fall back to ``--sampled-dir``.
+
 Matching is per-source nearest feasible candidate: each source independently
 picks its lowest-cost feasible target, so the same target may be matched by
-multiple sources (one-to-many on the target side). Cost is
+multiple sources (one-to-many on the target side). Candidates must pass a pose
+gate (``max_dist_m`` / ``max_rot_deg``) and a **frustum-overlap gate**: using
+the camera intrinsics from ``--calibration`` (default
+``info/calibration.json``) and the relative pose, a planar homography at
+``--plane-depth-m`` maps each image into the other and the symmetric overlap
+ratio must be >= ``--min-overlap``. Cost is
 
     cost = translation_m + rot_weight * rotation_deg
+           + overlap_weight * (1 - overlap)
 
-with a threshold gate (``max_dist_m`` / ``max_rot_deg``) that drops pairs whose
-nearest available partner is actually a different viewpoint.
+With ``--aligned-dir`` each matched pair is fisheye-undistorted, the target is
+warped into the source frame via the inverse homography, and both are cropped
+to their common visible area - aligned pairs ready for VLM comparison.
 
 Run with the backend venv so numpy is available, e.g.::
 
@@ -76,6 +87,160 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 _DEFAULT_DB = _REPO_ROOT / INSPECTION_DIRECTORY / "complete2" / "inspection_v2.db"
 _DEFAULT_SAMPLED_DIR = _REPO_ROOT / INSPECTION_DIRECTORY / "sampled_images"
 _DEFAULT_IMAGE_DIR = _REPO_ROOT / INSPECTION_DIRECTORY / "complete2" / "outputs" / "images"
+_DEFAULT_CALIBRATION = Path(__file__).resolve().parent / "info" / "calibration.json"
+
+
+# ---------------------------------------------------------------------------
+# Camera model / geometry helpers
+# ---------------------------------------------------------------------------
+
+def _load_calibration(path: Path) -> dict[str, dict[str, Any]]:
+    """Load per-lens intrinsics from ``info/calibration.json``.
+
+    Returns ``{"L": {...}, "R": {...}}`` where each entry holds the 3x3
+    pinhole intrinsic ``K`` (numpy), the OpenCV fisheye distortion coeffs
+    ``dist`` (numpy, 4), and the calibrated image size ``(width, height)``.
+    Lens parity "L"/"R" maps to the calibration entries named "left"/"right".
+    """
+    data = json.loads(Path(path).read_text())
+    out: dict[str, dict[str, Any]] = {}
+    for cam in data["cameras"]:
+        parity = "L" if cam["name"] == "left" else "R"
+        intr = cam["intrinsic"]
+        K = np.array(
+            [[intr["fl_x"], 0.0, intr["cx"]],
+             [0.0, intr["fl_y"], intr["cy"]],
+             [0.0, 0.0, 1.0]],
+            dtype=float,
+        )
+        dp = cam["distortion"]["params"]
+        dist = np.array([dp["k1"], dp["k2"], dp["k3"], dp["k4"]], dtype=float)
+        out[parity] = {
+            "K": K,
+            "dist": dist,
+            "width": int(cam["width"]),
+            "height": int(cam["height"]),
+        }
+    if "L" not in out or "R" not in out:
+        raise ValueError(f"calibration {path} must define 'left' and 'right' cameras")
+    return out
+
+
+def _quat_to_R(q: np.ndarray) -> np.ndarray:
+    """Quaternion (x, y, z, w) -> 3x3 rotation matrix."""
+    x, y, z, w = q
+    n = math.sqrt(x * x + y * y + z * z + w * w) or 1.0
+    x, y, z, w = x / n, y / n, z / n, w / n
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ])
+
+
+def _pose_rt(row: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+    """(R, t) camera-to-world from a row's ``tx/ty/tz/rx/ry/rz/rw`` fields."""
+    R = _quat_to_R(np.array([row["rx"], row["ry"], row["rz"], row["rw"]], dtype=float))
+    t = np.array([row["tx"], row["ty"], row["tz"]], dtype=float)
+    return R, t
+
+
+def _homography_src_to_tgt(
+    K_s: np.ndarray, K_t: np.ndarray,
+    R_s: np.ndarray, t_s: np.ndarray,
+    R_t: np.ndarray, t_t: np.ndarray,
+    plane_depth_m: float,
+) -> np.ndarray:
+    """Planar homography mapping source-image pixels to target-image pixels.
+
+    Uses a fronto-parallel plane (normal [0,0,1]) at ``plane_depth_m`` in the
+    source camera frame: ``H = K_t (R_rel + t_rel n^T / d) K_s^-1`` with
+    ``X_tgt = R_rel X_src + t_rel``.
+    """
+    R_rel = R_t.T @ R_s
+    t_rel = R_t.T @ (t_s - t_t)
+    n = np.array([[0.0], [0.0], [1.0]])
+    H = K_t @ (R_rel + (t_rel.reshape(3, 1) @ n.T) / plane_depth_m) @ np.linalg.inv(K_s)
+    return H
+
+
+def _scaled_H(H: np.ndarray, scale_s: float, scale_t: float) -> np.ndarray:
+    """Rescale a homography for images downscaled by ``scale_s`` / ``scale_t``."""
+    S_s = np.diag([scale_s, scale_s, 1.0])
+    S_t = np.diag([scale_t, scale_t, 1.0])
+    H2 = S_t @ H @ np.linalg.inv(S_s)
+    return H2 / H2[2, 2]
+
+
+def _frustum_overlap(
+    H: np.ndarray,
+    src_wh: tuple[int, int],
+    tgt_wh: tuple[int, int],
+    scale: float = 0.25,
+) -> float:
+    """Symmetric 2D overlap ratio between the two views under homography ``H``.
+
+    Warps a full-white source mask into the target frame (and vice versa with
+    ``H^-1``) at a reduced ``scale`` for speed and returns
+    ``min(frac_of_target_covered, frac_of_source_covered)`` in [0, 1]. This is
+    the depth-slice frustum overlap: with a plane at the assumed scene depth,
+    it measures how much of each image's footprint lands inside the other.
+    """
+    import cv2
+
+    sw, sh = max(1, int(src_wh[0] * scale)), max(1, int(src_wh[1] * scale))
+    tw, th = max(1, int(tgt_wh[0] * scale)), max(1, int(tgt_wh[1] * scale))
+    H_s2t = _scaled_H(H, scale, scale)
+    ones_s = np.full((sh, sw), 255, dtype=np.uint8)
+    ones_t = np.full((th, tw), 255, dtype=np.uint8)
+    warped_s = cv2.warpPerspective(ones_s, H_s2t, (tw, th)) > 0
+    frac_t = float(warped_s.sum()) / float(tw * th)
+    try:
+        warped_t = cv2.warpPerspective(ones_t, np.linalg.inv(H_s2t), (sw, sh)) > 0
+        frac_s = float(warped_t.sum()) / float(sw * sh)
+    except np.linalg.LinAlgError:
+        frac_s = 0.0
+    return min(frac_s, frac_t)
+
+
+class _Undistorter:
+    """Caches cv2.fisheye undistort maps per (lens, image size)."""
+
+    def __init__(self, calib: dict[str, dict[str, Any]]):
+        self._calib = calib
+        self._maps: dict[tuple[str, int, int], tuple[Any, Any]] = {}
+
+    def undistort(self, img: np.ndarray, parity: str) -> np.ndarray:
+        import cv2
+
+        h, w = img.shape[:2]
+        key = (parity, w, h)
+        if key not in self._maps:
+            cam = self._calib[parity]
+            K = cam["K"].copy()
+            # Rescale intrinsics if the stored image size differs from the
+            # calibrated sensor size.
+            sx, sy = w / cam["width"], h / cam["height"]
+            K[0, 0] *= sx
+            K[1, 1] *= sy
+            K[0, 2] *= sx
+            K[1, 2] *= sy
+            self._maps[key] = cv2.fisheye.initUndistortRectifyMap(
+                K, cam["dist"], np.eye(3), K, (w, h), cv2.CV_16SC2
+            )
+        m1, m2 = self._maps[key]
+        return cv2.remap(img, m1, m2, interpolation=cv2.INTER_LINEAR)
+
+    def K(self, parity: str, img_wh: tuple[int, int] | None = None) -> np.ndarray:
+        """Pinhole K for ``parity``, rescaled to ``img_wh`` if given."""
+        cam = self._calib[parity]
+        K = cam["K"].copy()
+        if img_wh is not None:
+            K[0, 0] *= img_wh[0] / cam["width"]
+            K[0, 2] *= img_wh[0] / cam["width"]
+            K[1, 1] *= img_wh[1] / cam["height"]
+            K[1, 2] *= img_wh[1] / cam["height"]
+        return K
 
 
 def _fmt_num(x: float) -> str:
@@ -185,6 +350,11 @@ def _match_all(
     max_rot_deg: float,
     rot_weight: float,
     cross_lens_penalty: float = 0.1,
+    calib: dict[str, dict[str, Any]] | None = None,
+    min_overlap: float = 0.0,
+    plane_depth_m: float = 3.0,
+    overlap_weight: float = 0.0,
+    overlap_scale: float = 0.25,
 ) -> list[dict[str, Any]]:
     """Per-source nearest feasible candidate (targets may be reused).
 
@@ -198,8 +368,15 @@ def _match_all(
     prevents a source from matching its own L/R sibling, which shares an
     identical pose (trans=0, rot=0) and would otherwise always win.
 
-    Cost is ``trans + rot_weight * rot`` (plus ``cross_lens_penalty`` for
-    cross-lens pairs).
+    When ``calib`` is given, every pose-feasible candidate is additionally
+    gated on **frustum overlap**: a planar homography at ``plane_depth_m``
+    (fronto-parallel depth slice, using the calibration intrinsics and the
+    relative pose) maps each image into the other, and the symmetric overlap
+    ratio must be >= ``min_overlap``. The homography and overlap are stored on
+    the returned pair so the caller can warp/crop aligned image pairs.
+
+    Cost is ``trans + rot_weight * rot + overlap_weight * (1 - overlap)``
+    (plus ``cross_lens_penalty`` for cross-lens pairs).
 
     Returns one dict per kept pair. Sources with no acceptable candidate are
     omitted; the caller reports them.
@@ -219,33 +396,56 @@ def _match_all(
     tgt_lens = np.array([c["parity"] for c in candidates])[None, :]  # (1, M)
     same_lens = (src_lens == tgt_lens)  # (N, M) bool
 
-    cost = trans + rot_weight * rot
+    base_cost = trans + rot_weight * rot
     # Add a small penalty to cross-lens pairs so same-lens wins ties.
-    cost = np.where(same_lens, cost, cost + cross_lens_penalty)
+    base_cost = np.where(same_lens, base_cost, base_cost + cross_lens_penalty)
 
-    # Gate: rotation near 0 (both same- and cross-lens). Translation within max_dist_m.
-    rot_ok = rot <= max_rot_deg
-    infeasible = (trans > max_dist_m) | ~rot_ok
-    cost = np.where(infeasible, np.inf, cost)
+    # Pose gate: rotation near 0 (both same- and cross-lens). Translation within max_dist_m.
+    feasible = (trans <= max_dist_m) & (rot <= max_rot_deg)
 
     pairs: list[dict[str, Any]] = []
     for i in range(len(sources)):
-        j = int(np.argmin(cost[i]))
-        if not np.isfinite(cost[i, j]):
+        feas_idx = np.flatnonzero(feasible[i])
+        if feas_idx.size == 0:
             continue
-        s, c = sources[i], candidates[j]
-        pairs.append(
-            {
-                "sampled_id": int(s["id"]),
-                "target_id": int(c["id"]),
-                "parity": s["parity"],
-                "target_parity": c["parity"],
-                "match_type": "same_lens" if same_lens[i, j] else "cross_lens",
-                "translation_m": float(trans[i, j]),
-                "rotation_deg": float(rot[i, j]),
-                "cost": float(cost[i, j]),
-            }
-        )
+        s = sources[i]
+        R_s, t_s = _pose_rt(s)
+        best: dict[str, Any] | None = None
+        for j in feas_idx:
+            c = candidates[int(j)]
+            cost = float(base_cost[i, j])
+            overlap: float | None = None
+            H: np.ndarray | None = None
+            if calib is not None:
+                cam_s, cam_t = calib[s["parity"]], calib[c["parity"]]
+                R_t, t_t = _pose_rt(c)
+                H = _homography_src_to_tgt(
+                    cam_s["K"], cam_t["K"], R_s, t_s, R_t, t_t, plane_depth_m
+                )
+                overlap = _frustum_overlap(
+                    H,
+                    (cam_s["width"], cam_s["height"]),
+                    (cam_t["width"], cam_t["height"]),
+                    scale=overlap_scale,
+                )
+                if overlap < min_overlap:
+                    continue
+                cost += overlap_weight * (1.0 - overlap)
+            if best is None or cost < best["cost"]:
+                best = {
+                    "sampled_id": int(s["id"]),
+                    "target_id": int(c["id"]),
+                    "parity": s["parity"],
+                    "target_parity": c["parity"],
+                    "match_type": "same_lens" if same_lens[i, j] else "cross_lens",
+                    "translation_m": float(trans[i, j]),
+                    "rotation_deg": float(rot[i, j]),
+                    "overlap": overlap,
+                    "homography_src_to_tgt": H.tolist() if H is not None else None,
+                    "cost": cost,
+                }
+        if best is not None:
+            pairs.append(best)
     return pairs
 
 
@@ -303,6 +503,7 @@ def _commit_pairs(
     pairs: list[dict[str, Any]],
     source_ids: list[int],
     skip_existing: bool,
+    delete_unmatched: bool = False,
 ) -> int:
     """Store only ``inspection_image`` on existing ``abnormal_detections`` rows.
 
@@ -313,9 +514,10 @@ def _commit_pairs(
     column.
 
     Rows whose ``gt_image`` belongs to this run's source set but found no
-    acceptable target (i.e. the source id is not in any matched pair) are
-    **deleted** from ``abnormal_detections`` - the user asked for unmatched
-    gt rows to be removed so the table only carries pairs that actually
+    acceptable target (i.e. the source id is not in any matched pair) are left
+    with a NULL ``inspection_image`` so a later run can retry them. With
+    ``delete_unmatched`` they are instead **deleted** from
+    ``abnormal_detections`` so the table only carries pairs that actually
     matched.
 
     With ``skip_existing`` (default), matched pairs whose row already has a
@@ -346,7 +548,7 @@ def _commit_pairs(
         )
         updated += cur.rowcount
 
-    if unmatched:
+    if unmatched and delete_unmatched:
         placeholders = ",".join("?" * len(unmatched))
         cur = conn.execute(
             f"DELETE FROM abnormal_detections "
@@ -491,6 +693,122 @@ def _copy_split_images(
         print(f"[warn] {len(missing)} image(s) missing when copying to split dirs: "
               f"{missing}", file=sys.stderr)
     return n_src, n_tgt
+
+
+def _load_unmatched_gt_ids(conn: sqlite3.Connection) -> list[int]:
+    """``gt_image`` ids of ``abnormal_detections`` rows not yet matched.
+
+    Returns an empty list when the table does not exist (e.g. the sampler has
+    never committed gt images to this database).
+    """
+    try:
+        rows = conn.execute(
+            "SELECT gt_image FROM abnormal_detections "
+            "WHERE gt_image IS NOT NULL AND inspection_image IS NULL "
+            "ORDER BY gt_image"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    return [int(r["gt_image"]) for r in rows]
+
+
+def _write_aligned_pairs(
+    pairs: list[dict[str, Any]],
+    sampled_dir: Path,
+    image_dir: Path,
+    out_dir: Path,
+    calib: dict[str, dict[str, Any]],
+    max_dim: int = 1024,
+) -> list[Path]:
+    """Write geometry-aligned, overlap-cropped image pairs for VLM input.
+
+    For each matched pair the source (reference) and target images are
+    fisheye-undistorted, the target is warped into the source frame with the
+    inverse of the stored homography, and both are cropped to the bounding
+    box of their common visible area (the warped-target footprint). Per pair,
+    three files are written into ``out_dir``:
+
+    - ``<src_ts>_<par>__<tgt_ts>_<tpar>_ref.jpg``  cropped source (reference)
+    - ``<src_ts>_<par>__<tgt_ts>_<tpar>_tgt.jpg``  cropped warped target
+    - ``<src_ts>_<par>__<tgt_ts>_<tpar>_merged.jpg`` side-by-side debug view
+
+    Crops are downscaled so their longest side is at most ``max_dim``. The
+    crop rectangle (in undistorted source pixels) is written back onto each
+    pair dict as ``crop_xywh``. Returns the list of merged debug files.
+    """
+    try:
+        import cv2
+    except ImportError as e:  # pragma: no cover
+        print(f"[error] aligned output needs opencv (cv2): missing: {e}", file=sys.stderr)
+        raise
+
+    undistorter = _Undistorter(calib)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    merged: list[Path] = []
+    for pp in pairs:
+        H_list = pp.get("homography_src_to_tgt")
+        if H_list is None:
+            print(f"[warn] pair {pp['sampled_id']}->{pp['target_id']}: no homography "
+                  f"(matched without calibration), skipped", file=sys.stderr)
+            continue
+        src_path = sampled_dir / f"{pp['sampled_id']}.jpg"
+        tgt_path = image_dir / f"{pp['target_id']}.jpg"
+        if not src_path.exists():
+            src_path = image_dir / f"{pp['sampled_id']}.jpg"
+        src_img = cv2.imread(str(src_path))
+        tgt_img = cv2.imread(str(tgt_path))
+        if src_img is None or tgt_img is None:
+            print(f"[warn] pair {pp['sampled_id']}->{pp['target_id']}: missing/"
+                  f"undecodable image, skipped", file=sys.stderr)
+            continue
+
+        src_und = undistorter.undistort(src_img, pp["parity"])
+        tgt_und = undistorter.undistort(tgt_img, pp["target_parity"])
+        sh, sw = src_und.shape[:2]
+        th, tw = tgt_und.shape[:2]
+
+        # Rescale the homography (computed on calibration-size images) to the
+        # actual undistorted image sizes.
+        cam_s = calib[pp["parity"]]
+        cam_t = calib[pp["target_parity"]]
+        H = _scaled_H(
+            np.array(H_list, dtype=float),
+            sw / cam_s["width"],
+            tw / cam_t["width"],
+        )
+        # Warp target into the source frame.
+        H_t2s = np.linalg.inv(H)
+        warped_tgt = cv2.warpPerspective(tgt_und, H_t2s, (sw, sh))
+        valid = cv2.warpPerspective(
+            np.full((th, tw), 255, dtype=np.uint8), H_t2s, (sw, sh)
+        ) > 0
+        ys, xs = np.nonzero(valid)
+        if ys.size == 0:
+            print(f"[warn] pair {pp['sampled_id']}->{pp['target_id']}: empty overlap "
+                  f"after warp, skipped", file=sys.stderr)
+            continue
+        x0, x1 = int(xs.min()), int(xs.max()) + 1
+        y0, y1 = int(ys.min()), int(ys.max()) + 1
+        pp["crop_xywh"] = [x0, y0, x1 - x0, y1 - y0]
+
+        ref_crop = src_und[y0:y1, x0:x1]
+        tgt_crop = warped_tgt[y0:y1, x0:x1]
+        scale = min(1.0, max_dim / max(ref_crop.shape[:2]))
+        if scale < 1.0:
+            new_wh = (int(ref_crop.shape[1] * scale), int(ref_crop.shape[0] * scale))
+            ref_crop = cv2.resize(ref_crop, new_wh, interpolation=cv2.INTER_AREA)
+            tgt_crop = cv2.resize(tgt_crop, new_wh, interpolation=cv2.INTER_AREA)
+
+        src_ts = pp.get("sampled_timestamp", pp["sampled_id"])
+        tgt_ts = pp.get("target_timestamp", pp["target_id"])
+        stem = f"{src_ts}_{pp['parity']}__{tgt_ts}_{pp['target_parity']}"
+        cv2.imwrite(str(out_dir / f"{stem}_ref.jpg"), ref_crop)
+        cv2.imwrite(str(out_dir / f"{stem}_tgt.jpg"), tgt_crop)
+        side = np.hstack([ref_crop, tgt_crop])
+        merged_path = out_dir / f"{stem}_merged.jpg"
+        cv2.imwrite(str(merged_path), side)
+        merged.append(merged_path)
+    return merged
 
 
 def _resample_images(
@@ -709,6 +1027,50 @@ def main(argv: list[str] | None = None) -> int:
         help="When --sample-interval-m is set, do not clear --sampled-dir before writing",
     )
     p.add_argument("--target-inspection", type=int, default=2, help="Inspection id to match against (default 2)")
+    p.add_argument(
+        "--no-gt-db",
+        dest="gt_db",
+        action="store_false",
+        help="Do NOT take the source set from unmatched gt_image rows of the "
+             "abnormal_detections table; use --sampled-dir instead. By default "
+             "the table is used whenever it holds unmatched gt rows.",
+    )
+    p.set_defaults(gt_db=True)
+    p.add_argument(
+        "--calibration",
+        default=str(_DEFAULT_CALIBRATION),
+        help="Camera calibration JSON with per-lens intrinsics + fisheye "
+             "distortion (default: info/calibration.json next to this script)",
+    )
+    p.add_argument(
+        "--min-overlap",
+        type=float,
+        default=0.5,
+        help="Minimum symmetric frustum overlap ratio [0..1] for a valid pair "
+             "(default 0.5). Computed via a planar homography at "
+             "--plane-depth-m using the calibration intrinsics.",
+    )
+    p.add_argument(
+        "--plane-depth-m",
+        type=float,
+        default=3.0,
+        help="Assumed scene depth (m) of the fronto-parallel plane used for "
+             "the frustum-overlap homography (default 3.0)",
+    )
+    p.add_argument(
+        "--overlap-weight",
+        type=float,
+        default=0.5,
+        help="Cost weight on (1 - overlap); higher prefers larger common "
+             "visible area over smaller pose error (default 0.5)",
+    )
+    p.add_argument(
+        "--aligned-dir",
+        default=None,
+        help="Write aligned/cropped image pairs (undistorted, target warped "
+             "into the source frame, cropped to the common overlap ROI) into "
+             "this folder, ready for VLM comparison.",
+    )
     p.add_argument("--max-dist-m", type=float, default=1.5, help="Max translation (m) for a valid pair")
     p.add_argument("--max-rot-deg", type=float, default=12.0,
                    help="Max rotation (deg) for a matched pair (near 0 deg)")
@@ -772,9 +1134,17 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--commit",
         action="store_true",
-        help="Fill inspection_image on abnormal_detections for matched pairs and DELETE "
-             "rows whose gt_image was unmatched in this run (gt_image is assumed to be "
-             "pre-populated by sample_images_along_trajectory.py --commit-gt).",
+        help="Fill inspection_image on abnormal_detections for matched pairs "
+             "(gt_image is assumed to be pre-populated by "
+             "sample_images_along_trajectory.py --commit-gt). Unmatched gt rows "
+             "are kept with NULL inspection_image unless --delete-unmatched is set.",
+    )
+    p.add_argument(
+        "--delete-unmatched",
+        action="store_true",
+        help="With --commit, DELETE abnormal_detections rows whose gt_image "
+             "found no acceptable target in this run instead of keeping them "
+             "for a later retry.",
     )
     p.add_argument(
         "--no-skip-existing",
@@ -820,7 +1190,14 @@ def main(argv: list[str] | None = None) -> int:
     args.plot_out = str(run_dir / "trajectory.png")
     args.matched_dir = str(run_dir / label)
     args.copy_split_dir = str(run_dir / "split_pairs")
+    args.aligned_dir = str(run_dir / "aligned_pairs")
     args.plot = True
+
+    calib_path = Path(args.calibration).resolve()
+    if not calib_path.exists():
+        print(f"[error] calibration not found: {calib_path}", file=sys.stderr)
+        return 2
+    calib = _load_calibration(calib_path)
 
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
@@ -859,13 +1236,23 @@ def main(argv: list[str] | None = None) -> int:
                       f"image(s) excluded (ambiguous lens): {src_unpaired}", file=sys.stderr)
             src_label = f"all of inspection {args.source_inspection}"
         else:
-            if not sampled_dir.exists():
-                print(f"[error] sampled dir not found: {sampled_dir}", file=sys.stderr)
-                return 2
-            source_ids = _load_sampled_ids(sampled_dir)
+            source_ids: list[int] = []
+            if args.gt_db:
+                source_ids = _load_unmatched_gt_ids(conn)
+                if source_ids:
+                    print(f"[info] source: {len(source_ids)} unmatched gt_image(s) "
+                          f"from abnormal_detections (inspection_image IS NULL)")
             if not source_ids:
-                print(f"[error] no <id>.jpg files found in {sampled_dir}", file=sys.stderr)
-                return 2
+                if args.gt_db:
+                    print("[info] no unmatched gt rows in abnormal_detections; "
+                          "falling back to --sampled-dir", file=sys.stderr)
+                if not sampled_dir.exists():
+                    print(f"[error] sampled dir not found: {sampled_dir}", file=sys.stderr)
+                    return 2
+                source_ids = _load_sampled_ids(sampled_dir)
+                if not source_ids:
+                    print(f"[error] no <id>.jpg files found in {sampled_dir}", file=sys.stderr)
+                    return 2
             src_insp = _resolve_source_inspection(conn, source_ids)
             if src_insp is None:
                 print("[error] could not resolve which inspection the sampled images belong to", file=sys.stderr)
@@ -904,13 +1291,20 @@ def main(argv: list[str] | None = None) -> int:
               f"({len(target_rows)} imgs: {len(by_parity_tgt['L'])} L / {len(by_parity_tgt['R'])} R)")
         print(f"[info] source parity: {len(by_parity_src['L'])} L / {len(by_parity_src['R'])} R")
         print(f"[info] gate: max_dist={args.max_dist_m} m, max_rot={args.max_rot_deg} deg, "
-              f"rot_weight={args.rot_weight}, cross_lens_penalty={args.cross_lens_penalty}")
+              f"min_overlap={args.min_overlap}, rot_weight={args.rot_weight}, "
+              f"overlap_weight={args.overlap_weight}, "
+              f"cross_lens_penalty={args.cross_lens_penalty}")
+        print(f"[info] calibration: {calib_path} (plane_depth={args.plane_depth_m} m)")
 
         all_pairs = _match_all(
             source_rows, target_rows,
             args.max_dist_m, args.max_rot_deg,
             args.rot_weight,
             args.cross_lens_penalty,
+            calib=calib,
+            min_overlap=args.min_overlap,
+            plane_depth_m=args.plane_depth_m,
+            overlap_weight=args.overlap_weight,
         )
         matched_src_ids: set[int] = {pp["sampled_id"] for pp in all_pairs}
         print(f"[info] matched {len(all_pairs)}/{len(source_rows)} source image(s) "
@@ -939,6 +1333,13 @@ def main(argv: list[str] | None = None) -> int:
             pp["sampled_timestamp"] = ts_lookup.get(pp["sampled_id"])
             pp["target_timestamp"] = ts_lookup.get(pp["target_id"])
 
+        if args.aligned_dir:
+            aligned_dir = Path(args.aligned_dir).resolve()
+            merged = _write_aligned_pairs(
+                all_pairs, sampled_dir, Path(args.image_dir), aligned_dir, calib,
+            )
+            print(f"[info] wrote {len(merged)} aligned/cropped pair(s) to {aligned_dir}")
+
         if args.plot:
             src_insp = args.sample_inspection if args.sample_interval_m is not None \
                 else (args.source_inspection if args.source_inspection is not None
@@ -947,10 +1348,13 @@ def main(argv: list[str] | None = None) -> int:
                                pairs=all_pairs, out_path=args.plot_out)
 
         print("\n=== matched pairs ===")
-        print(f"{'src_id':>7} {'parity':>6} {'tgt_id':>7} {'tgt_par':>7} {'type':>9} {'trans_m':>9} {'rot_deg':>8} {'cost':>7}")
+        print(f"{'src_id':>7} {'parity':>6} {'tgt_id':>7} {'tgt_par':>7} {'type':>9} "
+              f"{'trans_m':>9} {'rot_deg':>8} {'overlap':>8} {'cost':>7}")
         for pp in all_pairs:
+            ov = f"{pp['overlap']:.3f}" if pp.get("overlap") is not None else "-"
             print(f"{pp['sampled_id']:>7} {pp['parity']:>6} {pp['target_id']:>7} {pp['target_parity']:>7} "
-                  f"{pp['match_type']:>9} {pp['translation_m']:>9.3f} {pp['rotation_deg']:>8.2f} {pp['cost']:>7.3f}")
+                  f"{pp['match_type']:>9} {pp['translation_m']:>9.3f} {pp['rotation_deg']:>8.2f} "
+                  f"{ov:>8} {pp['cost']:>7.3f}")
 
         if args.json_path:
             # Only matched pairs go into the JSON; unmatched sources are
@@ -967,6 +1371,12 @@ def main(argv: list[str] | None = None) -> int:
                     "parity": pp["parity"],
                     "target_parity": pp["target_parity"],
                     "match_type": pp["match_type"],
+                    "translation_m": pp["translation_m"],
+                    "rotation_deg": pp["rotation_deg"],
+                    "overlap": pp.get("overlap"),
+                    "cost": pp["cost"],
+                    "homography_src_to_tgt": pp.get("homography_src_to_tgt"),
+                    "crop_xywh": pp.get("crop_xywh"),
                     "sampled_timestamp": pp.get("sampled_timestamp"),
                     "target_timestamp": pp.get("target_timestamp"),
                 }
@@ -1017,10 +1427,12 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.commit:
             all_source_ids = [r["id"] for r in source_rows]
-            n = _commit_pairs(conn, all_pairs, all_source_ids, args.skip_existing)
+            n = _commit_pairs(conn, all_pairs, all_source_ids, args.skip_existing,
+                              delete_unmatched=args.delete_unmatched)
+            n_unmatched = len(all_source_ids) - len(all_pairs)
             print(f"[info] set inspection_image on {n} abnormal_detections row(s); "
-                  f"removed unmatched gt row(s) for {len(all_source_ids)-len(all_pairs)} "
-                  f"unmatched source id(s)")
+                  f"{n_unmatched} unmatched source id(s) "
+                  f"{'deleted' if args.delete_unmatched else 'kept (NULL inspection_image)'}")
 
         if args.config_out:
             config = {
@@ -1039,6 +1451,13 @@ def main(argv: list[str] | None = None) -> int:
                 "max_rot_deg": args.max_rot_deg,
                 "rot_weight": args.rot_weight,
                 "cross_lens_penalty": args.cross_lens_penalty,
+                "calibration": str(calib_path),
+                "min_overlap": args.min_overlap,
+                "plane_depth_m": args.plane_depth_m,
+                "overlap_weight": args.overlap_weight,
+                "gt_db_source": args.gt_db,
+                "aligned_dir": args.aligned_dir,
+                "delete_unmatched": args.delete_unmatched,
                 "json_path": args.json_path,
                 "matched_dir": args.matched_dir,
                 "copy_split_dir": args.copy_split_dir,
