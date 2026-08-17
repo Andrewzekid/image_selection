@@ -50,6 +50,8 @@ source/target folders, and the trajectory plot all under
         --copy-split-dir "inspection_database/split_pairs" \
         --json "inspection_database/pairs_insp3_tight.json" \
         --config-out "inspection_database/config.json"
+
+Need to add --commit to store the matched pairs in the ``abnormal_detections`` table of the database (the ``gt_image`` column is pre-populated by ``sample_images_along_trajectory.py --commit-gt``; this matcher only fills in the ``inspection_image`` column for each source gt image).
 """
 
 from __future__ import annotations
@@ -297,44 +299,65 @@ def _resolve_source_inspection(conn: sqlite3.Connection, sampled_ids: list[int])
 
 
 def _commit_pairs(
-    conn: sqlite3.Connection, pairs: list[dict[str, Any]], skip_existing: bool
+    conn: sqlite3.Connection,
+    pairs: list[dict[str, Any]],
+    source_ids: list[int],
+    skip_existing: bool,
 ) -> int:
-    """Insert matched pairs into abnormal_detections(gt_image, inspection_image).
+    """Store only ``inspection_image`` on existing ``abnormal_detections`` rows.
 
-    ``gt_image`` is the inspection-1 (reference) id, ``inspection_image`` the
-    inspection-2 id. With ``skip_existing`` (default), pairs already present are
-    left untouched so LLM-annotated rows are never clobbered. Returns the number
-    inserted.
+    The ``gt_image`` column is populated up front by
+    ``sample_images_along_trajectory.py --commit-gt``; this matcher only fills
+    in the matched ``inspection_image`` (the target inspection id) for each
+    source gt id. It never inserts new rows and never touches the ``gt_image``
+    column.
+
+    Rows whose ``gt_image`` belongs to this run's source set but found no
+    acceptable target (i.e. the source id is not in any matched pair) are
+    **deleted** from ``abnormal_detections`` - the user asked for unmatched
+    gt rows to be removed so the table only carries pairs that actually
+    matched.
+
+    With ``skip_existing`` (default), matched pairs whose row already has a
+    non-NULL ``inspection_image`` are left untouched so previously matched /
+    LLM-annotated rows are never clobbered. Returns the number of rows whose
+    ``inspection_image`` was set by this call.
     """
-    # Assign ids explicitly (starting at MAX(id)+1) rather than relying on the
-    # table's AUTOINCREMENT counter. AUTOINCREMENT keeps a monotonic high-water
-    # mark in sqlite_sequence that never decreases, so after rows are deleted the
-    # raw id would otherwise resume from a stale value (e.g. 526) instead of
-    # continuing sequentially from the surviving rows.
-    next_id = conn.execute(
-        "SELECT COALESCE(MAX(id), 0) + 1 FROM abnormal_detections"
-    ).fetchone()[0]
-    inserted = 0
-    for p in pairs:
-        gt, src = p["sampled_id"], p["target_id"]
+    if not source_ids:
+        return 0
+
+    matched: dict[int, int] = {p["sampled_id"]: p["target_id"] for p in pairs}
+    unmatched = [sid for sid in source_ids if sid not in matched]
+
+    updated = 0
+    for gt_id, tgt_id in matched.items():
         if skip_existing:
-            exists = conn.execute(
+            row = conn.execute(
                 "SELECT 1 FROM abnormal_detections "
-                "WHERE gt_image = ? AND inspection_image = ? LIMIT 1",
-                (gt, src),
+                "WHERE gt_image = ? AND inspection_image IS NOT NULL LIMIT 1",
+                (gt_id,),
             ).fetchone()
-            if exists:
+            if row:
                 continue
-        conn.execute(
-            "INSERT INTO abnormal_detections "
-            "(id, gt_image, inspection_image, status, summary, viewpoint_change) "
-            "VALUES (?, ?, ?, 'NOT_PROCESSED', '', 0)",
-            (next_id, gt, src),
+        cur = conn.execute(
+            "UPDATE abnormal_detections SET inspection_image = ? "
+            "WHERE gt_image = ?",
+            (tgt_id, gt_id),
         )
-        next_id += 1
-        inserted += 1
+        updated += cur.rowcount
+
+    if unmatched:
+        placeholders = ",".join("?" * len(unmatched))
+        cur = conn.execute(
+            f"DELETE FROM abnormal_detections "
+            f"WHERE gt_image IN ({placeholders})",
+            unmatched,
+        )
+        print(f"[info] removed {cur.rowcount} unmatched gt row(s) "
+              f"(gt_image in {unmatched})", file=sys.stderr)
+
     conn.commit()
-    return inserted
+    return updated
 
 
 def _load_timestamps(conn: sqlite3.Connection) -> dict[int, int]:
@@ -749,13 +772,15 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--commit",
         action="store_true",
-        help="Insert matched pairs into abnormal_detections (off by default; does not clobber existing rows)",
+        help="Fill inspection_image on abnormal_detections for matched pairs and DELETE "
+             "rows whose gt_image was unmatched in this run (gt_image is assumed to be "
+             "pre-populated by sample_images_along_trajectory.py --commit-gt).",
     )
     p.add_argument(
         "--no-skip-existing",
         dest="skip_existing",
         action="store_false",
-        help="With --commit, also re-insert pairs that already exist in abnormal_detections",
+        help="With --commit, also overwrite inspection_image on rows already matched",
     )
     p.add_argument(
         "--config-out",
@@ -991,9 +1016,11 @@ def main(argv: list[str] | None = None) -> int:
                       f"rot={nr:.2f} deg, cost={cost:.3f})")
 
         if args.commit:
-            n = _commit_pairs(conn, all_pairs, args.skip_existing)
-            mode = "inserted" if args.skip_existing else "inserted (incl. duplicates)"
-            print(f"[info] {n} pair(s) {mode} into abnormal_detections")
+            all_source_ids = [r["id"] for r in source_rows]
+            n = _commit_pairs(conn, all_pairs, all_source_ids, args.skip_existing)
+            print(f"[info] set inspection_image on {n} abnormal_detections row(s); "
+                  f"removed unmatched gt row(s) for {len(all_source_ids)-len(all_pairs)} "
+                  f"unmatched source id(s)")
 
         if args.config_out:
             config = {

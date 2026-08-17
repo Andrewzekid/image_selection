@@ -33,10 +33,72 @@ import sys
 from pathlib import Path
 from typing import Any
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
-_DEFAULT_DB = _REPO_ROOT / "MTR Inspection Database" / "inspection_v2.db"
-_DEFAULT_IMAGE_DIR = _REPO_ROOT / "MTR Inspection Database" / "outputs" / "images"
-_DEFAULT_OUT_DIR = _REPO_ROOT / "MTR Inspection Database" / "sampled_images"
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_DEFAULT_DB = _REPO_ROOT / "inspection_database" / "complete3" / "inspection_v2.db"
+_DEFAULT_IMAGE_DIR = _REPO_ROOT / "inspection_database" / "complete3" / "outputs" / "images"
+_DEFAULT_OUT_DIR = _REPO_ROOT / "inspection_database" / "sampled_images"
+
+
+def _ensure_abnormal_detections(conn: sqlite3.Connection) -> None:
+    """Create the ``abnormal_detections`` table if it does not yet exist.
+
+    Mirrors the schema the rest of the backend expects (see
+    ``backend/scripts/smoke_safety_net_images.py`` and
+    ``backend/app/services/db_service.py``). ``gt_image`` is the
+    inspection-1 (ground truth) image id; ``inspection_image`` is the
+    matched target inspection image id (filled in later by
+    ``match_images_by_pose.py``). ``status`` defaults to ``NOT_PROCESSED``.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS abnormal_detections (
+            id                INTEGER PRIMARY KEY,
+            gt_image          INTEGER,
+            inspection_image  INTEGER,
+            status            TEXT DEFAULT 'NOT_PROCESSED',
+            summary           TEXT DEFAULT '',
+            viewpoint_change   INTEGER DEFAULT 0
+        )
+        """
+    )
+    conn.commit()
+
+
+def _commit_gt_images(
+    conn: sqlite3.Connection, gt_ids: list[int], skip_existing: bool
+) -> int:
+    """Write the sampled inspection-1 ids into ``abnormal_detections.gt_image``.
+
+    Each sampled id is inserted as a new row with ``gt_image`` set and
+    ``inspection_image`` left NULL (filled in later by the pose matcher). With
+    ``skip_existing`` (default), ids already present in ``gt_image`` are left
+    untouched so matcher-populated rows / LLM annotations are never clobbered.
+    Returns the number of rows inserted.
+    """
+    if not gt_ids:
+        return 0
+    next_id = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) + 1 FROM abnormal_detections"
+    ).fetchone()[0]
+    inserted = 0
+    for gid in gt_ids:
+        if skip_existing:
+            exists = conn.execute(
+                "SELECT 1 FROM abnormal_detections WHERE gt_image = ? LIMIT 1",
+                (gid,),
+            ).fetchone()
+            if exists:
+                continue
+        conn.execute(
+            "INSERT INTO abnormal_detections "
+            "(id, gt_image, inspection_image, status, summary, viewpoint_change) "
+            "VALUES (?, ?, NULL, 'NOT_PROCESSED', '', 0)",
+            (next_id, gid),
+        )
+        next_id += 1
+        inserted += 1
+    conn.commit()
+    return inserted
 
 
 def _load_pairs(
@@ -154,6 +216,13 @@ def main(argv: list[str] | None = None) -> int:
                    help="Do not copy files; only compute the sampled set and write --json")
     p.add_argument("--json", dest="json_path", default=None,
                    help="Write the sampled list (ids + arc-lengths) to this JSON file")
+    p.add_argument("--commit-gt", action="store_true",
+                   help="Insert the sampled ids into abnormal_detections.gt_image in the db "
+                        "(off by default; creates the table if missing and does not clobber "
+                        "existing gt_image rows)")
+    p.add_argument("--no-skip-existing-gt", dest="skip_existing_gt", action="store_false",
+                   help="With --commit-gt, also re-insert sampled ids already present as gt_image")
+    p.set_defaults(skip_existing_gt=True)
     args = p.parse_args(argv)
 
     db_path = Path(args.db).resolve()
@@ -164,6 +233,9 @@ def main(argv: list[str] | None = None) -> int:
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     try:
+        # Ensure the abnormal_detections table exists up front so both the
+        # sampler and downstream match_images_by_pose.py can rely on it.
+        _ensure_abnormal_detections(conn)
         views, unpaired = _load_pairs(conn, args.inspection)
         if not views:
             print(f"[error] no pose-bearing viewpoints in inspection {args.inspection}", file=sys.stderr)
@@ -220,33 +292,37 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.no_copy:
             print("[info] --no-copy: skipping file copy")
-            return 0
+        else:
+            image_dir = Path(args.image_dir)
+            out_dir = Path(args.out_dir)
+            if not image_dir.exists():
+                print(f"[error] image dir not found: {image_dir}", file=sys.stderr)
+                return 2
+            out_dir.mkdir(parents=True, exist_ok=True)
+            if not args.keep_existing:
+                for f in out_dir.iterdir():
+                    if f.is_file():
+                        f.unlink()
 
-        image_dir = Path(args.image_dir)
-        out_dir = Path(args.out_dir)
-        if not image_dir.exists():
-            print(f"[error] image dir not found: {image_dir}", file=sys.stderr)
-            return 2
-        out_dir.mkdir(parents=True, exist_ok=True)
-        if not args.keep_existing:
-            for f in out_dir.iterdir():
-                if f.is_file():
-                    f.unlink()
+            copied = 0
+            missing: list[int] = []
+            for sid in sampled_ids:
+                src = image_dir / f"{sid}.jpg"
+                dst = out_dir / f"{sid}.jpg"
+                if not src.exists():
+                    missing.append(sid)
+                    continue
+                shutil.copy2(src, dst)
+                copied += 1
+            if missing:
+                print(f"[warn] {len(missing)} sampled id(s) missing in {image_dir}: {missing}",
+                      file=sys.stderr)
+            print(f"[info] copied {copied}/{len(sampled_ids)} image(s) to {out_dir}")
 
-        copied = 0
-        missing: list[int] = []
-        for sid in sampled_ids:
-            src = image_dir / f"{sid}.jpg"
-            dst = out_dir / f"{sid}.jpg"
-            if not src.exists():
-                missing.append(sid)
-                continue
-            shutil.copy2(src, dst)
-            copied += 1
-        if missing:
-            print(f"[warn] {len(missing)} sampled id(s) missing in {image_dir}: {missing}",
-                  file=sys.stderr)
-        print(f"[info] copied {copied}/{len(sampled_ids)} image(s) to {out_dir}")
+        if args.commit_gt:
+            n = _commit_gt_images(conn, sampled_ids, args.skip_existing_gt)
+            mode = "inserted" if args.skip_existing_gt else "inserted (incl. duplicates)"
+            print(f"[info] {n} sampled id(s) {mode} into abnormal_detections.gt_image")
     finally:
         conn.close()
     return 0
