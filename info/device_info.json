@@ -1,0 +1,28 @@
+{
+    "model": "MetaCam-EDU",
+    "SN": "ME20485085",
+    "detail": "https://console.cli.im/record/template",
+    "manufactured": false,
+    "hardware": {
+        "lidar": {
+            "model": "mid360"
+        },
+        "cameras": [
+            {
+                "id": 0,
+                "name": "left"
+            },
+            {
+                "id": 1,
+                "name": "right"
+            }
+        ],
+        "storage": {
+            "use_internal": false,
+            "use_external": true
+        }
+    },
+    "version": "v1.1",
+    "region": "global",
+    "product": "*"
+}

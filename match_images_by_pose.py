@@ -16,10 +16,13 @@ By default the source set is read from the database: the ``gt_image`` ids of
 ``abnormal_detections`` rows whose ``inspection_image`` is still NULL (i.e. gt
 images not yet matched). Use ``--no-gt-db`` to fall back to ``--sampled-dir``.
 
-Matching is per-source nearest feasible candidate: each source independently
-picks its lowest-cost feasible target, so the same target may be matched by
-multiple sources (one-to-many on the target side). Candidates must pass a pose
-gate (``max_dist_m`` / ``max_rot_deg``) and a **frustum-overlap gate**: using
+Matching direction is chosen with ``--match-direction`` (default ``target``):
+each target image independently picks its lowest-cost feasible source, so the
+same source may be matched by multiple targets (one-to-many on the source
+side). With ``--match-direction source`` the direction is reversed: each
+source independently picks its best target (one-to-many on the target side).
+Candidates must pass a pose gate (``max_dist_m`` / ``max_rot_deg``) and a
+**frustum-overlap gate**: using
 the camera intrinsics from ``--calibration`` (default
 ``info/calibration.json``) and the relative pose, a planar homography at
 ``--plane-depth-m`` maps each image into the other and the symmetric overlap
@@ -355,12 +358,17 @@ def _match_all(
     plane_depth_m: float = 3.0,
     overlap_weight: float = 0.0,
     overlap_scale: float = 0.25,
+    per_target: bool = False,
 ) -> list[dict[str, Any]]:
-    """Per-source nearest feasible candidate (targets may be reused).
+    """Per-query nearest feasible candidate (the other side may be reused).
 
-    Each source independently picks its lowest-cost feasible target. The same
-    target can therefore be matched by multiple sources (one-to-many on the
-    target side).
+    With ``per_target=False`` each source independently picks its lowest-cost
+    feasible target; the same target can therefore be matched by multiple
+    sources (one-to-many on the target side). With ``per_target=True`` the
+    direction is reversed: each target independently picks its lowest-cost
+    feasible source, so the same source can be matched by multiple targets
+    (one-to-many on the source side). Either way each query image gets at most
+    one counterpart.
 
     Both same-lens (L->L, R->R) and cross-lens (L->R, R->L) pairs are
     considered. A small ``cross_lens_penalty`` (in metre-equivalent cost
@@ -372,29 +380,36 @@ def _match_all(
     gated on **frustum overlap**: a planar homography at ``plane_depth_m``
     (fronto-parallel depth slice, using the calibration intrinsics and the
     relative pose) maps each image into the other, and the symmetric overlap
-    ratio must be >= ``min_overlap``. The homography and overlap are stored on
-    the returned pair so the caller can warp/crop aligned image pairs.
+    ratio must be >= ``min_overlap``. The homography (always source -> target)
+    and overlap are stored on the returned pair so the caller can warp/crop
+    aligned image pairs.
 
     Cost is ``trans + rot_weight * rot + overlap_weight * (1 - overlap)``
     (plus ``cross_lens_penalty`` for cross-lens pairs).
 
-    Returns one dict per kept pair. Sources with no acceptable candidate are
-    omitted; the caller reports them.
+    Returns one dict per kept pair (``sampled_id`` = source/gt id,
+    ``target_id`` = target id, regardless of direction). Query images with no
+    acceptable candidate are omitted; the caller reports them.
     """
     if not sources or not candidates:
         return []
 
-    P = np.array([[s["tx"], s["ty"], s["tz"]] for s in sources], dtype=float)
-    C = np.array([[c["tx"], c["ty"], c["tz"]] for c in candidates], dtype=float)
-    qP = np.array([[s["rx"], s["ry"], s["rz"], s["rw"]] for s in sources], dtype=float)
-    qC = np.array([[c["rx"], c["ry"], c["rz"], c["rw"]] for c in candidates], dtype=float)
+    if per_target:
+        queries, pool = candidates, sources
+    else:
+        queries, pool = sources, candidates
 
-    trans = np.sqrt(((P[:, None, :] - C[None, :, :]) ** 2).sum(-1))  # (N, M)
-    rot = _quat_rotation_deg(qP, qC)                                  # (N, M)
+    P = np.array([[q["tx"], q["ty"], q["tz"]] for q in queries], dtype=float)
+    C = np.array([[c["tx"], c["ty"], c["tz"]] for c in pool], dtype=float)
+    qP = np.array([[q["rx"], q["ry"], q["rz"], q["rw"]] for q in queries], dtype=float)
+    qC = np.array([[c["rx"], c["ry"], c["rz"], c["rw"]] for c in pool], dtype=float)
 
-    src_lens = np.array([s["parity"] for s in sources])[:, None]  # (N, 1)
-    tgt_lens = np.array([c["parity"] for c in candidates])[None, :]  # (1, M)
-    same_lens = (src_lens == tgt_lens)  # (N, M) bool
+    trans = np.sqrt(((P[:, None, :] - C[None, :, :]) ** 2).sum(-1))  # (Q, M)
+    rot = _quat_rotation_deg(qP, qC)                                  # (Q, M)
+
+    q_lens = np.array([q["parity"] for q in queries])[:, None]  # (Q, 1)
+    p_lens = np.array([c["parity"] for c in pool])[None, :]  # (1, M)
+    same_lens = (q_lens == p_lens)  # (Q, M) bool
 
     base_cost = trans + rot_weight * rot
     # Add a small penalty to cross-lens pairs so same-lens wins ties.
@@ -404,21 +419,25 @@ def _match_all(
     feasible = (trans <= max_dist_m) & (rot <= max_rot_deg)
 
     pairs: list[dict[str, Any]] = []
-    for i in range(len(sources)):
+    for i in range(len(queries)):
         feas_idx = np.flatnonzero(feasible[i])
         if feas_idx.size == 0:
             continue
-        s = sources[i]
-        R_s, t_s = _pose_rt(s)
+        q = queries[i]
         best: dict[str, Any] | None = None
         for j in feas_idx:
-            c = candidates[int(j)]
+            c = pool[int(j)]
+            if per_target:
+                s, t = c, q  # pool member is the source, query is the target
+            else:
+                s, t = q, c
             cost = float(base_cost[i, j])
             overlap: float | None = None
             H: np.ndarray | None = None
             if calib is not None:
-                cam_s, cam_t = calib[s["parity"]], calib[c["parity"]]
-                R_t, t_t = _pose_rt(c)
+                cam_s, cam_t = calib[s["parity"]], calib[t["parity"]]
+                R_s, t_s = _pose_rt(s)
+                R_t, t_t = _pose_rt(t)
                 H = _homography_src_to_tgt(
                     cam_s["K"], cam_t["K"], R_s, t_s, R_t, t_t, plane_depth_m
                 )
@@ -434,9 +453,9 @@ def _match_all(
             if best is None or cost < best["cost"]:
                 best = {
                     "sampled_id": int(s["id"]),
-                    "target_id": int(c["id"]),
+                    "target_id": int(t["id"]),
                     "parity": s["parity"],
-                    "target_parity": c["parity"],
+                    "target_parity": t["parity"],
                     "match_type": "same_lens" if same_lens[i, j] else "cross_lens",
                     "translation_m": float(trans[i, j]),
                     "rotation_deg": float(rot[i, j]),
@@ -1043,6 +1062,17 @@ def main(argv: list[str] | None = None) -> int:
              "distortion (default: info/calibration.json next to this script)",
     )
     p.add_argument(
+        "--no-frustum",
+        dest="use_frustum",
+        action="store_false",
+        help="Disable the frustum-overlap gate and homography-based cost. "
+             "With this flag, matching uses only the pose gate (max_dist_m / "
+             "max_rot_deg) and cost = trans + rot_weight * rot; --min-overlap, "
+             "--plane-depth-m, and --overlap-weight are ignored. Note: without "
+             "the homography, --aligned-dir pairs are skipped (no warp/crop).",
+    )
+    p.set_defaults(use_frustum=True)
+    p.add_argument(
         "--min-overlap",
         type=float,
         default=0.5,
@@ -1072,6 +1102,15 @@ def main(argv: list[str] | None = None) -> int:
              "this folder, ready for VLM comparison.",
     )
     p.add_argument("--max-dist-m", type=float, default=1.5, help="Max translation (m) for a valid pair")
+    p.add_argument(
+        "--match-direction",
+        choices=["source", "target"],
+        default="target",
+        help="Which side independently picks its nearest feasible counterpart "
+             "(the other side may be reused, i.e. one-to-many on the other "
+             "side). 'target' (default): each target image picks its best "
+             "source. 'source': each source image picks its best target.",
+    )
     p.add_argument("--max-rot-deg", type=float, default=12.0,
                    help="Max rotation (deg) for a matched pair (near 0 deg)")
     p.add_argument("--rot-weight", type=float, default=0.15, help="m-per-deg rotation weight in the cost")
@@ -1291,9 +1330,11 @@ def main(argv: list[str] | None = None) -> int:
               f"({len(target_rows)} imgs: {len(by_parity_tgt['L'])} L / {len(by_parity_tgt['R'])} R)")
         print(f"[info] source parity: {len(by_parity_src['L'])} L / {len(by_parity_src['R'])} R")
         print(f"[info] gate: max_dist={args.max_dist_m} m, max_rot={args.max_rot_deg} deg, "
-              f"min_overlap={args.min_overlap}, rot_weight={args.rot_weight}, "
-              f"overlap_weight={args.overlap_weight}, "
-              f"cross_lens_penalty={args.cross_lens_penalty}")
+              f"min_overlap={args.min_overlap if args.use_frustum else 'n/a'}, "
+              f"rot_weight={args.rot_weight}, "
+              f"overlap_weight={args.overlap_weight if args.use_frustum else 'n/a'}, "
+              f"cross_lens_penalty={args.cross_lens_penalty}"
+              f"{'' if args.use_frustum else ' [frustum overlap DISABLED via --no-frustum]'}")
         print(f"[info] calibration: {calib_path} (plane_depth={args.plane_depth_m} m)")
 
         all_pairs = _match_all(
@@ -1301,26 +1342,36 @@ def main(argv: list[str] | None = None) -> int:
             args.max_dist_m, args.max_rot_deg,
             args.rot_weight,
             args.cross_lens_penalty,
-            calib=calib,
-            min_overlap=args.min_overlap,
+            calib=calib if args.use_frustum else None,
+            min_overlap=args.min_overlap if args.use_frustum else 0.0,
             plane_depth_m=args.plane_depth_m,
-            overlap_weight=args.overlap_weight,
+            overlap_weight=args.overlap_weight if args.use_frustum else 0.0,
+            per_target=args.match_direction == "target",
         )
-        matched_src_ids: set[int] = {pp["sampled_id"] for pp in all_pairs}
-        print(f"[info] matched {len(all_pairs)}/{len(source_rows)} source image(s) "
-              f"against {len(target_rows)} candidate(s)")
+        per_target = args.match_direction == "target"
+        if per_target:
+            query_rows, pool_rows = target_rows, source_rows
+            query_label, pool_label = "target", "source"
+        else:
+            query_rows, pool_rows = source_rows, target_rows
+            query_label, pool_label = "source", "target"
+        query_id_key = "target_id" if per_target else "sampled_id"
+        matched_query_ids: set[int] = {pp[query_id_key] for pp in all_pairs}
+        print(f"[info] matched {len(all_pairs)}/{len(query_rows)} {query_label} image(s) "
+              f"against {len(pool_rows)} {pool_label} candidate(s)")
 
         # Candidate pool for unmatched diagnostics.
-        diag_tgt = target_rows
+        diag_pool = pool_rows
 
-        # Diagnostics for unmatched sources: nearest candidate distance.
-        unmatched = [r for r in source_rows if r["id"] not in matched_src_ids]
+        # Diagnostics for unmatched query images: nearest candidate distance.
+        unmatched = [r for r in query_rows if r["id"] not in matched_query_ids]
         if unmatched:
-            print(f"\n[info] {len(unmatched)} unmatched source image(s) - "
+            print(f"\n[info] {len(unmatched)} unmatched {query_label} image(s) - "
                   f"nearest candidate:")
             for r in sorted(unmatched, key=lambda x: x["id"]):
-                nt, nr, nid, mt = _nearest_distance(r, diag_tgt, args.cross_lens_penalty)
-                print(f"  src id={r['id']:>4} ({r['parity']})  nearest target id={nid}  "
+                nt, nr, nid, mt = _nearest_distance(r, diag_pool, args.cross_lens_penalty)
+                print(f"  {query_label} id={r['id']:>4} ({r['parity']})  "
+                      f"nearest {pool_label} id={nid}  "
                       f"trans={nt:.3f} m  rot={nr:.2f} deg  match_type={mt}  "
                       f"(over gate -> no match)")
 
@@ -1405,9 +1456,10 @@ def main(argv: list[str] | None = None) -> int:
 
         # Results summary: matching stats + names of unmatched images.
         print("\n=== results summary ===")
-        print(f"  source images:      {len(source_rows)}")
+        print(f"  {query_label} images:     {len(query_rows)}")
+        print(f"  {pool_label} images:      {len(pool_rows)}")
         print(f"  matched pairs:      {len(all_pairs)}")
-        print(f"  unmatched images:   {len(unmatched)}")
+        print(f"  unmatched images:   {len(unmatched)}  (unmatched {query_label} image(s))")
         if all_pairs:
             t = [pp["translation_m"] for pp in all_pairs]
             r = [pp["rotation_deg"] for pp in all_pairs]
@@ -1416,16 +1468,21 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  rotation (deg):    min={min(r):.2f} med={sorted(r)[len(r)//2]:.2f} "
                   f"max={max(r):.2f}")
         if unmatched:
-            print("\n  unmatched image(s) (name -> id | nearest cost):")
+            print(f"\n  unmatched {query_label} image(s) (name -> id | nearest cost):")
             for r in sorted(unmatched, key=lambda x: x["id"]):
-                nt, nr, nid, mt = _nearest_distance(r, diag_tgt, args.cross_lens_penalty)
+                nt, nr, nid, mt = _nearest_distance(r, diag_pool, args.cross_lens_penalty)
                 cost = nt + args.rot_weight * nr
                 name = r["filename"] or f"{r['id']}.jpg"
                 print(f"    {name}  (id={r['id']}, parity={r['parity']}, "
-                      f"nearest tgt={nid}, match_type={mt}, trans={nt:.3f} m, "
+                      f"nearest {pool_label}={nid}, match_type={mt}, trans={nt:.3f} m, "
                       f"rot={nr:.2f} deg, cost={cost:.3f})")
 
         if args.commit:
+            if per_target:
+                print("[warn] --commit with --match-direction target: a source gt image "
+                      "may match several targets, but abnormal_detections stores only one "
+                      "inspection_image per gt_image row (one pair per gt is written)",
+                      file=sys.stderr)
             all_source_ids = [r["id"] for r in source_rows]
             n = _commit_pairs(conn, all_pairs, all_source_ids, args.skip_existing,
                               delete_unmatched=args.delete_unmatched)
@@ -1451,7 +1508,9 @@ def main(argv: list[str] | None = None) -> int:
                 "max_rot_deg": args.max_rot_deg,
                 "rot_weight": args.rot_weight,
                 "cross_lens_penalty": args.cross_lens_penalty,
+                "match_direction": args.match_direction,
                 "calibration": str(calib_path),
+                "use_frustum": args.use_frustum,
                 "min_overlap": args.min_overlap,
                 "plane_depth_m": args.plane_depth_m,
                 "overlap_weight": args.overlap_weight,
