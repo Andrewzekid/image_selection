@@ -784,50 +784,78 @@ def main(argv: list[str] | None = None) -> int:
                          else args.sample_inspection)
     label = f"insp{src_insp_for_name}vs{args.target_inspection}"
     # Override output paths with clean names inside the run folder. Image-based
-    # outputs are only enabled when their required image folders are present.
+    # outputs are only enabled when the user explicitly provides the relevant
+    # image folders; by default only pairs.json, config.json, and the
+    # trajectory plot are produced.
     args.json_path = str(run_dir / "pairs.json")
     args.config_out = str(run_dir / "config.json")
     args.plot_out = str(run_dir / "trajectory.png")
-    if sampled_dir is not None:
-        args.matched_dir = str(run_dir / label)
-        args.copy_split_dir = str(run_dir / "split_pairs")
-    else:
+    # Do not auto-enable image outputs from the run folder; they require
+    # --sampled-dir / --image-dir and are opt-in via those args.
+    if args.matched_dir is None:
         args.matched_dir = None
+    if args.copy_split_dir is None:
         args.copy_split_dir = None
     args.plot = True
 
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     if args.sample_interval_m is not None:
-        if sampled_dir is None or image_dir is None:
-            print("[error] --sample-interval-m needs --sampled-dir and --image-dir "
-                  "to read/write source images", file=sys.stderr)
+        # Sample the source inspection trajectory at a fixed interval. If
+        # --sampled-dir and --image-dir are provided, the picked images are
+        # also copied into --sampled-dir; otherwise the sampled ids are used
+        # directly as the source set without any image I/O.
+        views = _load_inspection(conn, args.sample_inspection)
+        if not views:
+            print(f"[error] no pose-bearing viewpoints in inspection {args.sample_inspection}", file=sys.stderr)
             conn.close()
             return 2
-        n = _resample_images(
-            conn,
-            sampled_dir,
-            image_dir,
-            args.sample_inspection,
-            args.sample_interval_m,
-            args.sample_start_index,
-            args.keep_sampled,
-        )
-        if n < 0:
-            conn.close()
-            return 2
-        print(f"[info] sampled {n} image(s) from inspection {args.sample_inspection} "
-              f"at {args.sample_interval_m} m into {sampled_dir}")
+        picked = sampler._sample_by_arclength(views, args.sample_interval_m, args.sample_start_index)
+        sampled_ids = sorted({int(v["id"]) for v in picked})
+        if sampled_dir is not None and image_dir is not None:
+            n = _resample_images(
+                conn,
+                sampled_dir,
+                image_dir,
+                args.sample_inspection,
+                args.sample_interval_m,
+                args.sample_start_index,
+                args.keep_sampled,
+            )
+            if n < 0:
+                conn.close()
+                return 2
+            print(f"[info] sampled {n} image(s) from inspection {args.sample_inspection} "
+                  f"at {args.sample_interval_m} m into {sampled_dir}")
+        else:
+            print(f"[info] trajectory-sampled {len(sampled_ids)} id(s) from inspection "
+                  f"{args.sample_inspection} at {args.sample_interval_m} m (no image copy)")
     try:
         target_rows = _load_inspection(conn, args.target_inspection)
         if not target_rows:
             print(f"[error] no pose-bearing images in inspection {args.target_inspection}", file=sys.stderr)
             return 2
 
-        # Resolve the source set.
+        # Resolve the source set (in priority order):
+        #   1. --source-inspection: all images of one inspection
+        #   2. --sample-interval-m: trajectory-sampled ids (computed above)
+        #   3. abnormal_detections gt_image rows (inspection_image IS NULL)
+        #   4. --sampled-dir: <id>.jpg filenames
+        #   5. Fallback: all images of --sample-inspection (DB-only mode)
         if args.source_inspection is not None:
             source_rows = _load_inspection(conn, args.source_inspection)
             src_label = f"all of inspection {args.source_inspection}"
+        elif args.sample_interval_m is not None:
+            # Trajectory sampling was done above (with or without image copy).
+            src_insp = args.sample_inspection
+            all_src = _load_inspection(conn, src_insp)
+            id_to_row = {r["id"]: r for r in all_src}
+            source_rows = [id_to_row[sid] for sid in sampled_ids if sid in id_to_row]
+            missing_ids = [sid for sid in sampled_ids if sid not in id_to_row]
+            if missing_ids:
+                print(f"[warn] {len(missing_ids)} sampled id(s) not found in inspection "
+                      f"{src_insp} (skipped): {missing_ids}", file=sys.stderr)
+            src_label = f"{len(source_rows)} trajectory-sampled image(s) from inspection {src_insp}"
         else:
             source_ids: list[int] = []
             if args.gt_db:
@@ -835,51 +863,43 @@ def main(argv: list[str] | None = None) -> int:
                 if source_ids:
                     print(f"[info] source: {len(source_ids)} unmatched gt_image(s) "
                           f"from abnormal_detections (inspection_image IS NULL)")
-            if not source_ids:
+            if not source_ids and sampled_dir is not None and sampled_dir.exists():
                 if args.gt_db:
                     print("[info] no unmatched gt rows in abnormal_detections; "
                           "falling back to --sampled-dir", file=sys.stderr)
-                if sampled_dir is None or not sampled_dir.exists():
-                    missing_dir = sampled_dir if sampled_dir is not None else "--sampled-dir"
-                    print(f"[error] sampled dir not found: {missing_dir} "
-                          f"(needed when no --source-inspection and no unmatched gt rows)",
-                          file=sys.stderr)
-                    return 2
                 source_ids = _load_sampled_ids(sampled_dir)
                 if not source_ids:
                     print(f"[error] no <id>.jpg files found in {sampled_dir}", file=sys.stderr)
                     return 2
-            src_insp = _resolve_source_inspection(conn, source_ids)
-            if src_insp is None:
-                print("[error] could not resolve which inspection the sampled images belong to", file=sys.stderr)
-                return 2
-            # Load every image of the source inspection and keep the sampled ids.
-            all_src = _load_inspection(conn, src_insp)
-            id_to_row = {r["id"]: r for r in all_src}
-            source_rows: list[dict[str, Any]] = []
-            missing: list[int] = []
-            for sid in source_ids:
-                r = id_to_row.get(sid)
-                if r is not None:
-                    source_rows.append(r)
-                else:
-                    missing.append(sid)
-            if missing:
-                print(f"[warn] {len(missing)} sampled id(s) not found in inspection "
-                      f"{src_insp} (skipped): {missing}", file=sys.stderr)
-            src_label = f"{len(source_rows)} sampled image(s) from inspection {src_insp}"
+            if source_ids:
+                src_insp = _resolve_source_inspection(conn, source_ids)
+                if src_insp is None:
+                    print("[error] could not resolve which inspection the sampled images belong to", file=sys.stderr)
+                    return 2
+                all_src = _load_inspection(conn, src_insp)
+                id_to_row = {r["id"]: r for r in all_src}
+                source_rows = [id_to_row[sid] for sid in source_ids if sid in id_to_row]
+                missing = [sid for sid in source_ids if sid not in id_to_row]
+                if missing:
+                    print(f"[warn] {len(missing)} sampled id(s) not found in inspection "
+                          f"{src_insp} (skipped): {missing}", file=sys.stderr)
+                src_label = f"{len(source_rows)} sampled image(s) from inspection {src_insp}"
+            else:
+                # No gt rows, no sampled dir: use all images of the sample
+                # inspection as the source set (DB-only mode, no image I/O).
+                src_insp = args.sample_inspection
+                source_rows = _load_inspection(conn, src_insp)
+                if not source_rows:
+                    print(f"[error] no pose-bearing images in inspection {src_insp} "
+                          f"to use as source", file=sys.stderr)
+                    return 2
+                src_label = f"all of inspection {src_insp} (DB-only)"
 
         print(f"[info] db: {db_path}")
         print(f"[info] source: {src_label}")
         print(f"[info] target: inspection {args.target_inspection} ({len(target_rows)} imgs)")
         print(f"[info] gate: max_dist={args.max_dist_m} m, max_rot={args.max_rot_deg} deg, "
               f"rot_weight={args.rot_weight}")
-        if sampled_dir is None:
-            print("[info] no --sampled-dir: image outputs (matched/split) "
-                  "will be skipped; only pairs JSON / trajectory plot produced")
-        if image_dir is None:
-            print("[info] no --image-dir: target image outputs (matched) "
-                  "will be skipped")
 
         all_pairs = _match_all(
             source_rows, target_rows,
